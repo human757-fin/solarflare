@@ -198,7 +198,7 @@ def status():
 def login():
     if request.method == "POST":
         password = request.form.get("password", "")
-        if secrets.compare_digest(password, WEBUI_PASSWORD):
+        if secrets.compare_digest(password.encode(), WEBUI_PASSWORD.encode()):
             session["authenticated"] = True
             session.permanent = True
             app.permanent_session_lifetime = timedelta(hours=12)
