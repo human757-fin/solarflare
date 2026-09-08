@@ -15,6 +15,8 @@ from flask import (
     flash,
 )
 
+from markupsafe import Markup
+
 import aiomysql
 import asyncio
 
@@ -160,7 +162,13 @@ LAYOUT = """<!DOCTYPE html>
 
 
 def render_page(title, body, page=""):
-    return render_template_string(LAYOUT, title=title, body=body, css=BASE_CSS, page=page)
+    return render_template_string(
+        LAYOUT,
+        title=title,
+        body=Markup(body),
+        css=Markup(BASE_CSS),
+        page=page,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -207,9 +215,7 @@ def login():
       </form>
     </div></div>
     """
-    return render_template_string(
-        "<!DOCTYPE html><html><head><title>Login</head><style>" + BASE_CSS + "</style></head><body>" + body + "</body></html>"
-    )
+    return render_page("Login", body, "login")
 
 
 @app.route("/logout")
