@@ -9,18 +9,23 @@ from datetime import datetime
 
 import aiomysql
 
+LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 LOG_FORMAT = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
-logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
+logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO), format=LOG_FORMAT)
 log = logging.getLogger("bot")
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
+BOT_TOKEN = os.environ.get("DISCORD_TOKEN")
 DB_HOST = os.environ.get("DB_HOST", "127.0.0.1")
 DB_PORT = int(os.environ.get("DB_PORT", 3306))
 DB_USER = os.environ.get("DB_USER")
 DB_PASSWORD = os.environ.get("DB_PASSWORD")
 DB_NAME = os.environ.get("DB_NAME")
+DB_SSL = os.environ.get("DB_SSL", "0") == "1"
+DATABASE_ENGINE = os.environ.get("DATABASE_ENGINE", "mysql")
+BOT_PORT = int(os.environ.get("BOT_PORT", 2067))
+DEV_GUILD_ID = os.environ.get("DEV_GUILD_ID", "")
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "")
-GITHUB_REPO = os.environ.get("GITHUB_REPO", "")
+GIT_ADDRESS = os.environ.get("GIT_ADDRESS", "")
 
 INTENTS = discord.Intents.default()
 INTENTS.message_content = True
@@ -37,6 +42,9 @@ bot.start_time = datetime.utcnow()
 # ---------------------------------------------------------------------------
 
 async def init_db():
+    kwargs = {}
+    if DB_SSL:
+        kwargs["ssl"] = {"ca": None}
     bot.db_pool = await aiomysql.create_pool(
         host=DB_HOST,
         port=DB_PORT,
@@ -46,6 +54,7 @@ async def init_db():
         autocommit=True,
         minsize=1,
         maxsize=10,
+        **kwargs,
     )
     async with bot.db_pool.acquire() as conn:
         async with conn.cursor() as cur:
@@ -104,8 +113,13 @@ async def on_ready():
     if not heartbeat_loop.is_running():
         heartbeat_loop.start()
     try:
-        synced = await bot.tree.sync()
-        log.info("Synced %s slash commands", len(synced))
+        if DEV_GUILD_ID and bot.get_guild(int(DEV_GUILD_ID)):
+            guild = discord.Object(id=int(DEV_GUILD_ID))
+            synced = await bot.tree.sync(guild=guild)
+            log.info("Synced %s slash commands to dev guild", len(synced))
+        else:
+            synced = await bot.tree.sync()
+            log.info("Synced %s slash commands", len(synced))
     except Exception:
         log.exception("Failed to sync slash commands")
 
@@ -249,12 +263,58 @@ async def slash_reload(interaction: discord.Interaction, cog: str):
 
 
 # ---------------------------------------------------------------------------
+# Health server
+# ---------------------------------------------------------------------------
+
+def run_health_server():
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    class HealthHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path == "/health":
+                body = b'{"status":"ok"}'
+                self.send_response(200)
+            else:
+                body = b'{"status":"unknown"}'
+                self.send_response(404)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_POST(self):
+            if self.path == "/restart":
+                body = b'{"status":"restarting"}'
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                threading.Thread(target=os._exit, args=(0,), daemon=True).start()
+                return
+            self.send_response(404)
+            self.end_headers()
+
+        def log_message(self, *args):
+            pass
+
+    server = HTTPServer(("0.0.0.0", BOT_PORT), HealthHandler)
+    log.info("Health server listening on port %s", BOT_PORT)
+    server.serve_forever()
+
+
+import threading
+health_thread = threading.Thread(target=run_health_server, daemon=True)
+health_thread.start()
+
+
+# ---------------------------------------------------------------------------
 # Entry
 # ---------------------------------------------------------------------------
 
 async def main():
     if not BOT_TOKEN:
-        log.error("BOT_TOKEN environment variable is not set")
+        log.error("DISCORD_TOKEN environment variable is not set")
         return
     await init_db()
     async with bot:

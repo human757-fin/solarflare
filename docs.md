@@ -19,33 +19,39 @@ All set in the Pterodactyl panel under **Startup → Variables**.
 
 | Variable | Description |
 |---|---|
-| `BOT_TOKEN` | Discord bot token |
+| `DISCORD_TOKEN` | Discord bot token |
 | `BOT_PY_FILE` | Bot filename (default `bot.py`) |
-| `GITHUB_REPO` | Repo URL for reference |
+| `BOT_PORT` | Bot health service port (default `2067`) |
+| `DEV_GUILD_ID` | Optional server ID for immediate command syncing |
+| `LOG_LEVEL` | Console logging detail (default `INFO`) |
 
 ### Database (MySQL)
 
 | Variable | Description |
 |---|---|
+| `DATABASE_ENGINE` | Database type (default `mysql`) |
 | `DB_HOST` | MySQL host (default `127.0.0.1`) |
 | `DB_PORT` | MySQL port (default `3306`) |
 | `DB_USER` | MySQL username |
 | `DB_PASSWORD` | MySQL password |
 | `DB_NAME` | MySQL database name |
+| `DB_SSL` | Enable TLS for DB connection (`1`/`0`) |
 
 ### Web Panel
 
 | Variable | Description |
 |---|---|
 | `WEBUI_PASSWORD` | Login password for the control panel |
-| `WEB_PANEL_PORT` | Panel port (default `8080`) |
-| `FLASK_SECRET` | Flask session secret key |
+| `WEB_PORT` | Panel port (default `2040`) |
+| `WEBUI_SECURE_COOKIE` | Require HTTPS for login cookie (`1`/`0`) |
 
 ### Optional
 
 | Variable | Description |
 |---|---|
 | `WEBHOOK_URL` | Discord webhook for heartbeat notifications |
+| `GIT_ADDRESS` | Git repository URL (used by egg) |
+| `BRANCH` | Git branch to pull (default `main`) |
 
 ## GitHub Secrets (for auto-deploy workflow)
 
@@ -64,6 +70,7 @@ Push to `main` or `master` triggers a server restart via the Pterodactyl Client 
 - **`/dashboard`** — Control panel (restart button, guild settings table)
 - **`/welcome-editor`** — Edit welcome embeds per guild (title, description, color, thumbnail, footer)
 - **`/api/status`** — JSON status endpoint
+- **Bot `/health`** on `BOT_PORT` — health endpoint (status page + restart)
 
 ## Bot Commands
 

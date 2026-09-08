@@ -22,14 +22,18 @@ app = Flask(__name__)
 app.secret_key = os.environ.get("FLASK_SECRET", secrets.token_hex(32))
 
 WEBUI_PASSWORD = os.environ.get("WEBUI_PASSWORD", "changeme")
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+BOT_TOKEN = os.environ.get("DISCORD_TOKEN", "")
 BOT_PY_FILE = os.environ.get("BOT_PY_FILE", "bot.py")
+WEB_PORT = int(os.environ.get("WEB_PORT", 2040))
+BOT_PORT = int(os.environ.get("BOT_PORT", 2067))
+WEBUI_SECURE_COOKIE = os.environ.get("WEBUI_SECURE_COOKIE", "0") == "1"
 
 DB_HOST = os.environ.get("DB_HOST", "127.0.0.1")
 DB_PORT = int(os.environ.get("DB_PORT", 3306))
 DB_USER = os.environ.get("DB_USER", "")
 DB_PASSWORD = os.environ.get("DB_PASSWORD", "")
 DB_NAME = os.environ.get("DB_NAME", "")
+DB_SSL = os.environ.get("DB_SSL", "0") == "1"
 
 log = logging.getLogger("webpanel")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
@@ -37,17 +41,21 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(na
 
 def get_db():
     loop = asyncio.new_event_loop()
+    kwargs = {}
+    if DB_SSL:
+        kwargs["ssl"] = {"ca": None}
     conn = loop.run_until_complete(
         aiomysql.connect(
             host=DB_HOST, port=DB_PORT, user=DB_USER,
             password=DB_PASSWORD, db=DB_NAME, autocommit=True,
+            **kwargs,
         )
     )
     return conn, loop
 
 
 def get_bot_stats():
-    stats = {"guilds": 0, "users": 0, "uptime": "N/A", "status": "unknown"}
+    stats = {"guilds": 0, "status": "unknown"}
     try:
         conn, loop = get_db()
         cursor = loop.run_until_complete(conn.cursor(aiomysql.DictCursor))
@@ -62,11 +70,15 @@ def get_bot_stats():
         pass
     try:
         result = subprocess.run(
-            ["pgrep", "-f", BOT_PY_FILE], capture_output=True, timeout=5
+            [
+                "curl", "-s", "-o", os.devnull, "-w", "%{http_code}",
+                f"http://127.0.0.1:{BOT_PORT}/health",
+            ],
+            capture_output=True, timeout=5,
         )
-        stats["status"] = "online" if result.returncode == 0 else "offline"
+        stats["status"] = "online" if result.stdout.decode().startswith("2") else "offline"
     except Exception:
-        stats["status"] = "unknown"
+        stats["status"] = "offline"
     return stats
 
 
@@ -182,6 +194,7 @@ def login():
             session["authenticated"] = True
             session.permanent = True
             app.permanent_session_lifetime = timedelta(hours=12)
+            app.session_cookie_secure = WEBUI_SECURE_COOKIE
             return redirect(url_for("dashboard"))
         flash("Invalid password", "error")
     body = """
@@ -378,7 +391,10 @@ def welcome_editor():
 @login_required
 def api_restart():
     try:
-        subprocess.Popen(["pkill", "-f", BOT_PY_FILE])
+        subprocess.run(
+            ["curl", "-s", "-X", "POST", f"http://127.0.0.1:{BOT_PORT}/restart"],
+            capture_output=True, timeout=5,
+        )
         flash("Bot restart signal sent", "success")
     except Exception as e:
         flash(f"Restart failed: {e}", "error")
@@ -396,5 +412,4 @@ def api_status():
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    port = int(os.environ.get("WEB_PANEL_PORT", 8080))
-    app.run(host="0.0.0.0", port=port, debug=False)
+    app.run(host="0.0.0.0", port=WEB_PORT, debug=False)
