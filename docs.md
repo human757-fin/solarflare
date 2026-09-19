@@ -50,6 +50,8 @@ All set in the Pterodactyl panel under **Startup → Variables**.
 | Variable | Description |
 |---|---|
 | `WEBHOOK_URL` | Discord webhook for heartbeat notifications |
+| `BOT_HEALTH_URL` | Health endpoint the panel polls (default `http://127.0.0.1:$BOT_PORT/health`) |
+| `BOT_RESTART_URL` | Restart endpoint used by the Dashboard button (default `http://127.0.0.1:$BOT_PORT/restart`) |
 | `GIT_ADDRESS` | Git repository URL (used by egg) |
 | `BRANCH` | Git branch to pull (default `main`) |
 
@@ -65,12 +67,23 @@ Push to `main` or `master` triggers a server restart via the Pterodactyl Client 
 
 ## Web Panel
 
-- **`/`** — Public status page (bot online/offline, guild count)
+- **`/`** — Public status page (bot online/offline, guild count, latency, uptime)
 - **`/login`** — Password login (uses `WEBUI_PASSWORD`)
-- **`/dashboard`** — Control panel (restart button, guild settings table)
+- **`/dashboard`** — Control panel (restart button, every guild the bot is in)
 - **`/welcome-editor`** — Edit welcome embeds per guild (title, description, color, thumbnail, footer)
 - **`/api/status`** — JSON status endpoint
-- **Bot `/health`** on `BOT_PORT` — health endpoint (status page + restart)
+- **Bot `/health`** on `BOT_PORT` — JSON status consumed by the panel (also `/restart`)
+
+### How the panel detects the bot
+
+The panel polls the bot's `/health` endpoint (`BOT_HEALTH_URL`, default
+`http://127.0.0.1:$BOT_PORT/health`). It returns the bot user, gateway readiness,
+latency, uptime, database state and the full `guild_list` (id, name, member count)
+so the Dashboard and Welcome Editor show the guilds the bot is really in.
+
+If `/health` does not answer, the panel shows **OFFLINE** and falls back to counting
+rows in `guild_settings`. Set `BOT_HEALTH_URL` / `BOT_RESTART_URL` if the panel runs
+on a different host than the bot.
 
 ## Bot Commands
 
@@ -84,11 +97,13 @@ Push to `main` or `master` triggers a server restart via the Pterodactyl Client 
 
 ## Welcome System
 
-Placeholders: `{user.mention}`, `{user.name}`, `{guild.name}`
+Placeholders: `{user.mention}`, `{user.name}`, `{guild.name}` — they are replaced
+in the welcome message and in the embed title, description and footer.
 
 - If a guild has a `welcome_embed` set, it sends that embed
 - Otherwise falls back to `welcome_message` text
-- Configure via `/welcome-editor` in the web panel
+- Configure via `/welcome-editor` in the web panel: pick a guild with **Load**,
+  then save with **Save Settings**
 
 ## Cogs
 

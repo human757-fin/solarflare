@@ -4,6 +4,7 @@ import asyncio
 import logging
 import aiohttp
 import discord
+from aiohttp import web
 from discord.ext import commands, tasks
 from datetime import datetime
 
@@ -103,6 +104,57 @@ async def upsert_guild_settings(guild_id: int, **kwargs):
 
 
 # ---------------------------------------------------------------------------
+# Welcome messages
+# ---------------------------------------------------------------------------
+
+DEFAULT_WELCOME_MESSAGE = "Welcome {user.mention} to **{guild.name}**!"
+
+
+def apply_welcome_placeholders(template: str, member: discord.Member) -> str:
+    """Substitute the supported ``{placeholders}`` in a welcome template."""
+    if not template:
+        return ""
+    return (
+        template.replace("{user.mention}", member.mention)
+        .replace("{user.name}", member.name)
+        .replace("{guild.name}", member.guild.name)
+    )
+
+
+def build_welcome_embed(raw_embed, member: discord.Member) -> discord.Embed | None:
+    """Build a welcome embed from stored JSON and fill in the placeholders.
+
+    Returns ``None`` when no embed is configured or it cannot be parsed so the
+    caller can fall back to the plain welcome message.
+    """
+    if not raw_embed:
+        return None
+    try:
+        data = json.loads(raw_embed) if isinstance(raw_embed, str) else raw_embed
+        if not isinstance(data, dict):
+            raise TypeError("stored welcome embed is not a JSON object")
+        embed = discord.Embed.from_dict(data)
+    except Exception:
+        log.warning(
+            "Failed to load custom welcome embed for guild %s, using default",
+            member.guild.id,
+        )
+        return None
+
+    if embed.title:
+        embed.title = apply_welcome_placeholders(embed.title, member)
+    if embed.description:
+        embed.description = apply_welcome_placeholders(embed.description, member)
+    footer = embed.footer
+    if footer and footer.text:
+        embed.set_footer(
+            text=apply_welcome_placeholders(footer.text, member),
+            icon_url=footer.icon_url,
+        )
+    return embed
+
+
+# ---------------------------------------------------------------------------
 # Events
 # ---------------------------------------------------------------------------
 
@@ -130,33 +182,35 @@ async def on_member_join(member: discord.Member):
     if not settings or not settings.get("welcome_channel_id"):
         return
 
-    channel = member.guild.get_channel(settings["welcome_channel_id"])
-    if not channel:
+    try:
+        channel_id = int(settings["welcome_channel_id"])
+    except (TypeError, ValueError):
+        log.warning("Invalid welcome channel for guild %s", member.guild.id)
         return
 
-    raw_embed = settings.get("welcome_embed")
-    if raw_embed:
-        try:
-            if isinstance(raw_embed, str):
-                data = json.loads(raw_embed)
-            else:
-                data = raw_embed
-            embed = discord.Embed.from_dict(data)
-            embed.description = (embed.description or "").replace(
-                "{user.mention}", member.mention
-            ).replace("{user.name}", member.name).replace(
-                "{guild.name}", member.guild.name
-            )
+    channel = member.guild.get_channel(channel_id)
+    if not hasattr(channel, "send"):
+        log.warning(
+            "Welcome channel %s in guild %s is missing or not sendable",
+            channel_id,
+            member.guild.id,
+        )
+        return
+
+    try:
+        embed = build_welcome_embed(settings.get("welcome_embed"), member)
+        if embed is not None:
             await channel.send(member.mention, embed=embed)
             return
-        except Exception:
-            log.warning("Failed to load custom embed for guild %s, using default", member.guild.id)
 
-    msg = (settings.get("welcome_message") or "Welcome {user.mention} to **{guild.name}**!")
-    msg = msg.replace("{user.mention}", member.mention).replace(
-        "{user.name}", member.name
-    ).replace("{guild.name}", member.guild.name)
-    await channel.send(msg)
+        msg = apply_welcome_placeholders(
+            settings.get("welcome_message") or DEFAULT_WELCOME_MESSAGE, member
+        )
+        await channel.send(msg)
+    except discord.Forbidden:
+        log.warning("Missing permissions to send the welcome message in guild %s", member.guild.id)
+    except discord.HTTPException:
+        log.exception("Failed to send the welcome message in guild %s", member.guild.id)
 
 
 # ---------------------------------------------------------------------------
@@ -262,6 +316,57 @@ async def slash_reload(interaction: discord.Interaction, cog: str):
         await interaction.response.send_message(f"Error: {e}", ephemeral=True)
 
 # ---------------------------------------------------------------------------
+# Health server (polled by webpanel.py)
+# ---------------------------------------------------------------------------
+
+async def health_handler(request: web.Request) -> web.Response:
+    try:
+        latency_ms = round(bot.latency * 1000)
+    except Exception:
+        # bot.latency needs a live gateway connection (and is NaN until ready)
+        latency_ms = None
+    payload = {
+        "status": "ok",
+        "ready": bot.is_ready,
+        "user": str(bot.user) if bot.user else None,
+        "user_id": bot.user.id if bot.user else None,
+        "guilds": len(bot.guilds),
+        "guild_list": [
+            {
+                "id": guild.id,
+                "name": guild.name,
+                "member_count": guild.member_count,
+                "icon": str(guild.icon.url) if guild.icon else None,
+            }
+            for guild in bot.guilds
+        ],
+        "latency_ms": latency_ms,
+        "uptime_seconds": int((datetime.utcnow() - bot.start_time).total_seconds()),
+        "database": bot.db_pool is not None,
+    }
+    return web.json_response(payload)
+
+
+async def restart_handler(request: web.Request) -> web.Response:
+    log.warning("Restart requested via the health endpoint")
+    # Letting the process exit is what makes Pterodactyl start it again.
+    asyncio.get_running_loop().call_later(0.5, os._exit, 0)
+    return web.json_response({"status": "restarting"})
+
+
+async def start_health_server() -> web.AppRunner:
+    app = web.Application()
+    app.router.add_get("/health", health_handler)
+    app.router.add_post("/restart", restart_handler)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", BOT_PORT)
+    await site.start()
+    log.info("Health server listening on port %s", BOT_PORT)
+    return runner
+
+
+# ---------------------------------------------------------------------------
 # Entry
 # ---------------------------------------------------------------------------
 
@@ -269,9 +374,14 @@ async def main():
     if not BOT_TOKEN:
         log.error("DISCORD_TOKEN environment variable is not set")
         return
-    async with bot:
-        await load_cogs()
-        await bot.start(BOT_TOKEN)
+    await init_db()
+    runner = await start_health_server()
+    try:
+        async with bot:
+            await load_cogs()
+            await bot.start(BOT_TOKEN)
+    finally:
+        await runner.cleanup()
 
 
 if __name__ == "__main__":

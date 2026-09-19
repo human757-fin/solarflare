@@ -2,7 +2,8 @@ import os
 import json
 import secrets
 import logging
-import subprocess
+import time
+import urllib.request
 from datetime import datetime, timedelta
 
 from flask import (
@@ -15,7 +16,7 @@ from flask import (
     flash,
 )
 
-from markupsafe import Markup
+from markupsafe import Markup, escape
 
 import aiomysql
 import asyncio
@@ -29,6 +30,9 @@ BOT_PY_FILE = os.environ.get("BOT_PY_FILE", "bot.py")
 WEB_PORT = int(os.environ.get("WEB_PORT", 2040))
 BOT_PORT = int(os.environ.get("BOT_PORT", 2067))
 WEBUI_SECURE_COOKIE = os.environ.get("WEBUI_SECURE_COOKIE", "0") == "1"
+
+BOT_HEALTH_URL = os.environ.get("BOT_HEALTH_URL", f"http://127.0.0.1:{BOT_PORT}/health")
+BOT_RESTART_URL = os.environ.get("BOT_RESTART_URL", f"http://127.0.0.1:{BOT_PORT}/restart")
 
 DB_HOST = os.environ.get("DB_HOST", "127.0.0.1")
 DB_PORT = int(os.environ.get("DB_PORT", 3306))
@@ -56,32 +60,110 @@ def get_db():
     return conn, loop
 
 
-def get_bot_stats():
-    stats = {"guilds": 0, "status": "unknown"}
+_health_cache = {"time": 0.0, "data": None}
+HEALTH_CACHE_SECONDS = 5
+
+
+def fetch_bot_health(timeout=2):
+    """Read the bot's /health endpoint. Returns the payload, or None when offline."""
+    now = time.time()
+    if now - _health_cache["time"] < HEALTH_CACHE_SECONDS:
+        return _health_cache["data"]
+
+    data = None
+    try:
+        with urllib.request.urlopen(BOT_HEALTH_URL, timeout=timeout) as resp:
+            if resp.status == 200:
+                data = json.loads(resp.read().decode("utf-8") or "{}")
+    except Exception:
+        pass
+
+    # Connection is closed by urlopen returning; only the result matters here.
+    _health_cache.update(time=now, data=data)
+    return data
+
+
+def get_db_guild_count():
+    """Guilds with stored settings, or None when the database is unreachable."""
     try:
         conn, loop = get_db()
         cursor = loop.run_until_complete(conn.cursor(aiomysql.DictCursor))
-        loop.run_until_complete(
-            cursor.execute("SELECT * FROM guild_settings LIMIT 100")
-        )
-        rows = loop.run_until_complete(cursor.fetchall())
+        loop.run_until_complete(cursor.execute("SELECT COUNT(*) AS total FROM guild_settings"))
+        row = loop.run_until_complete(cursor.fetchone())
         conn.close()
         loop.close()
-        stats["guilds"] = len(rows)
+        return int(row["total"]) if row else 0
     except Exception:
-        pass
+        return None
+
+
+def format_uptime(seconds) -> str:
     try:
-        result = subprocess.run(
-            [
-                "curl", "-s", "-o", os.devnull, "-w", "%{http_code}",
-                f"http://127.0.0.1:{BOT_PORT}/health",
-            ],
-            capture_output=True, timeout=5,
-        )
-        stats["status"] = "online" if result.stdout.decode().startswith("2") else "offline"
-    except Exception:
-        stats["status"] = "offline"
-    return stats
+        seconds = int(seconds)
+    except (TypeError, ValueError):
+        return "unknown"
+    days, rem = divmod(seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, secs = divmod(rem, 60)
+    if days:
+        return f"{days}d {hours}h {minutes}m"
+    if hours:
+        return f"{hours}h {minutes}m"
+    if minutes:
+        return f"{minutes}m {secs}s"
+    return f"{secs}s"
+
+
+def get_bot_stats():
+    """Bot status for the web panel, preferring the bot's own health endpoint."""
+    health = fetch_bot_health()
+    if health:
+        return {
+            "status": "online",
+            "guilds": int(health.get("guilds") or 0),
+            "guild_list": health.get("guild_list") or [],
+            "user": health.get("user"),
+            "ready": bool(health.get("ready", True)),
+            "latency_ms": health.get("latency_ms"),
+            "uptime_seconds": health.get("uptime_seconds"),
+            "database": bool(health.get("database")),
+            "source": "bot",
+        }
+
+    db_guilds = get_db_guild_count()
+    return {
+        "status": "offline",
+        "guilds": db_guilds or 0,
+        "guild_list": [],
+        "user": None,
+        "ready": False,
+        "latency_ms": None,
+        "uptime_seconds": None,
+        "database": db_guilds is not None,
+        "source": "db",
+    }
+
+
+DEFAULT_EMBED_COLOR = 0x5865F2
+
+
+def parse_hex_color(value: str, default: int = DEFAULT_EMBED_COLOR) -> int:
+    """Parse a ``#RRGGBB`` / ``RRGGBB`` string into an int, falling back to default."""
+    try:
+        color = int(str(value).replace("#", "").strip(), 16)
+    except (TypeError, ValueError):
+        return default
+    if not 0 <= color <= 0xFFFFFF:
+        return default
+    return color
+
+
+def color_to_hex(value) -> str:
+    """Render a stored embed color as a ``RRGGBB`` string for form inputs."""
+    try:
+        return f"{int(value):06x}"
+    except (TypeError, ValueError):
+        return f"{DEFAULT_EMBED_COLOR:06x}"
 
 
 def login_required(f):
@@ -179,13 +261,35 @@ def render_page(title, body, page=""):
 def status():
     stats = get_bot_stats()
     status_class = f"status-{stats['status']}"
+    guild_label = "Guilds" if stats["status"] == "online" else "Configured Guilds"
+
+    if stats["status"] == "online":
+        health_details = f"""
+      <p>Bot user: <code>{escape(stats['user'] or 'unknown')}</code></p>
+      <p>Gateway: <code>{'ready' if stats['ready'] else 'connecting'}</code></p>
+      <p>Latency: <code>{stats['latency_ms'] if stats['latency_ms'] is not None else 'n/a'} ms</code></p>
+      <p>Uptime: <code>{format_uptime(stats['uptime_seconds'])}</code></p>
+      <p>Database: <code>{'connected' if stats['database'] else 'unavailable'}</code></p>
+        """
+    else:
+        health_details = """
+      <p>No response from the bot's health endpoint, so the guild count falls back
+      to the number of stored guild settings.</p>
+      <p>Check the Pterodactyl console and that the bot listens on the health port.</p>
+        """
+
     body = f"""
     <h1>Solarflare Bot</h1>
     <div class="stat-grid">
       <div class="stat-box"><div class="label">Status</div><div class="value {status_class}">{stats['status'].upper()}</div></div>
-      <div class="stat-box"><div class="label">Guilds</div><div class="value">{stats['guilds']}</div></div>
+      <div class="stat-box"><div class="label">{guild_label}</div><div class="value">{stats['guilds']}</div></div>
     </div>
     <div class="card" style="margin-top:1rem">
+      <h2>Health Check</h2>
+      {health_details}
+      <p>Endpoint: <code>{escape(BOT_HEALTH_URL)}</code></p>
+    </div>
+    <div class="card">
       <h2>System</h2>
       <p>Bot process: <code>{BOT_PY_FILE}</code></p>
       <p>Uptime clock resets on restart. Check Pterodactyl panel for exact uptime.</p>
@@ -232,25 +336,42 @@ def logout():
 @login_required
 def dashboard():
     stats = get_bot_stats()
-    guilds = []
+    settings_by_guild = {}
     try:
         conn, loop = get_db()
         cursor = loop.run_until_complete(conn.cursor(aiomysql.DictCursor))
         loop.run_until_complete(cursor.execute("SELECT * FROM guild_settings ORDER BY guild_id"))
-        guilds = loop.run_until_complete(cursor.fetchall())
+        for row in loop.run_until_complete(cursor.fetchall()):
+            settings_by_guild[int(row["guild_id"])] = row
         conn.close()
         loop.close()
     except Exception as e:
         flash(f"DB error: {e}", "error")
 
+    # Guilds the bot is actually in, plus any leftover rows for guilds it has left.
+    known_guilds = {}
+    for guild in stats["guild_list"]:
+        known_guilds[int(guild["id"])] = {
+            "name": guild.get("name") or "Unknown",
+            "members": guild.get("member_count"),
+        }
+    for guild_id in settings_by_guild:
+        known_guilds.setdefault(guild_id, {"name": "(not joined anymore)", "members": None})
+
     rows = ""
-    for g in guilds:
-        wc = g.get("welcome_channel_id") or "—"
+    for guild_id, info in known_guilds.items():
+        settings = settings_by_guild.get(guild_id, {})
+        wc = settings.get("welcome_channel_id") or "—"
+        embed_flag = "Yes" if settings.get("welcome_embed") else "No"
+        members = info["members"] if info["members"] is not None else "—"
         rows += f"""<tr class="guild-row">
-          <td>{g['guild_id']}</td><td>{wc}</td><td>{'Yes' if g.get('welcome_embed') else 'No'}</td>
+          <td>{escape(info['name'])}<br><span style="color:#72767d">{guild_id}</span></td>
+          <td>{members}</td><td>{wc}</td><td>{embed_flag}</td>
+          <td><a href="/welcome-editor?guild_id={guild_id}">Edit</a></td>
         </tr>"""
     if not rows:
-        rows = '<tr><td colspan="3" style="color:#72767d">No guild settings found</td></tr>'
+        rows = ('<tr><td colspan="5" style="color:#72767d">'
+                'No guilds detected — is the bot running and connected to Discord?</td></tr>')
 
     body = f"""
     <h1>Dashboard</h1>
@@ -261,9 +382,9 @@ def dashboard():
       </div>
     </div>
     <div class="card">
-      <h2>Guild Settings</h2>
+      <h2>Guilds</h2>
       <table>
-        <tr><th>Guild ID</th><th>Welcome Channel</th><th>Custom Embed</th></tr>
+        <tr><th>Guild</th><th>Members</th><th>Welcome Channel</th><th>Custom Embed</th><th></th></tr>
         {rows}
       </table>
     </div>
@@ -274,7 +395,11 @@ def dashboard():
 @app.route("/welcome-editor", methods=["GET", "POST"])
 @login_required
 def welcome_editor():
-    guild_id = request.args.get("guild_id") or request.form.get("guild_id", "")
+    guild_id = (request.args.get("guild_id") or request.form.get("guild_id", "")).strip()
+    if guild_id and not guild_id.isdigit():
+        flash("Guild ID must be a number", "error")
+        guild_id = ""
+
     settings = None
     if guild_id:
         try:
@@ -286,28 +411,30 @@ def welcome_editor():
             settings = loop.run_until_complete(cursor.fetchone())
             conn.close()
             loop.close()
-        except Exception:
-            pass
+        except Exception as e:
+            flash(f"DB error: {e}", "error")
 
+    # Only the "Save Settings" form posts; the guild picker uses GET, so loading
+    # a guild's settings can never overwrite them.
     if request.method == "POST" and guild_id:
         welcome_channel = request.form.get("welcome_channel_id", "").strip()
         welcome_message = request.form.get("welcome_message", "").strip()
         embed_title = request.form.get("embed_title", "").strip()
         embed_description = request.form.get("embed_description", "").strip()
-        embed_color = request.form.get("embed_color", "5865F2").strip()
+        embed_color = request.form.get("embed_color", "").strip()
         embed_thumbnail = request.form.get("embed_thumbnail", "").strip()
         embed_footer = request.form.get("embed_footer", "").strip()
 
+        if welcome_channel and not welcome_channel.isdigit():
+            flash("Welcome channel ID must be a number", "error")
+            return redirect(f"/welcome-editor?guild_id={guild_id}")
+
         embed_data = None
-        if embed_title or embed_description:
-            try:
-                c = int(embed_color.replace("#", ""), 16)
-            except ValueError:
-                c = 0x5865F2
+        if embed_title or embed_description or embed_thumbnail or embed_footer:
             embed_data = {
                 "title": embed_title,
                 "description": embed_description,
-                "color": c,
+                "color": parse_hex_color(embed_color),
             }
             if embed_thumbnail:
                 embed_data["thumbnail"] = {"url": embed_thumbnail}
@@ -341,51 +468,78 @@ def welcome_editor():
 
         return redirect(f"/welcome-editor?guild_id={guild_id}")
 
-    wc = settings.get("welcome_channel_id", "") if settings else ""
-    wm = settings.get("welcome_message", "") if settings else ""
+    known_links = ""
+    for guild in get_bot_stats()["guild_list"]:
+        known_links += (
+            f'<li><a href="/welcome-editor?guild_id={int(guild["id"])}">'
+            f'{escape(guild.get("name") or "Unknown")} '
+            f'<span style="color:#72767d">{int(guild["id"])}</span></a></li>'
+        )
+    known_block = (
+        f'<ul style="margin-top:0.5rem;list-style:none;padding:0">{known_links}</ul>'
+        if known_links
+        else '<p style="color:#72767d;margin-top:0.5rem">No guilds reported by the bot — '
+             'start the bot or enter an ID manually.</p>'
+    )
+
+    wc = (settings.get("welcome_channel_id") or "") if settings else ""
+    wm = (settings.get("welcome_message") or "") if settings else ""
     embed = {}
     if settings and settings.get("welcome_embed"):
+        raw_embed = settings["welcome_embed"]
         try:
-            embed = settings["welcome_embed"] if isinstance(settings["welcome_embed"], dict) else json.loads(settings["welcome_embed"])
+            embed = raw_embed if isinstance(raw_embed, dict) else json.loads(raw_embed)
         except Exception:
-            pass
+            embed = {}
+    if not isinstance(embed, dict):
+        embed = {}
+
+    thumbnail = embed.get("thumbnail")
+    thumbnail_url = thumbnail.get("url", "") if isinstance(thumbnail, dict) else ""
+    footer = embed.get("footer")
+    footer_text = footer.get("text", "") if isinstance(footer, dict) else ""
 
     body = f"""
     <h1>Welcome Embed Editor</h1>
-    <form method="post">
+    <form method="get" action="/welcome-editor">
       <div class="card">
         <h2>Select Guild</h2>
         <label>Guild ID</label>
-        <input type="number" name="guild_id" value="{guild_id}" placeholder="Discord Guild ID" required>
+        <input type="number" name="guild_id" value="{escape(guild_id)}" placeholder="Discord Guild ID" required>
         <button class="btn btn-primary" type="submit" style="margin-top:0.25rem">Load</button>
+        <h2>Guilds The Bot Is In</h2>
+        {known_block}
       </div>
+    </form>
     """
 
     if guild_id:
         body += f"""
+      <form method="post" action="/welcome-editor">
+      <input type="hidden" name="guild_id" value="{escape(guild_id)}">
       <div class="card">
         <h2>Channel</h2>
         <label>Welcome Channel ID</label>
-        <input type="number" name="welcome_channel_id" value="{wc or ''}" placeholder="Channel ID">
+        <input type="number" name="welcome_channel_id" value="{escape(wc)}" placeholder="Channel ID">
         <label>Default Welcome Message (used if no embed)</label>
-        <input type="text" name="welcome_message" value="{wm or ''}" placeholder="Welcome {{user.mention}} to {{guild.name}}!">
+        <input type="text" name="welcome_message" value="{escape(wm)}" placeholder="Welcome {{user.mention}} to {{guild.name}}!">
       </div>
       <div class="card">
         <h2>Embed Settings</h2>
         <label>Title</label>
-        <input type="text" name="embed_title" value="{embed.get('title', '')}" placeholder="Welcome!">
+        <input type="text" name="embed_title" value="{escape(embed.get('title') or '')}" placeholder="Welcome!">
         <label>Description</label>
-        <textarea name="embed_description" placeholder="Use {{user.mention}}, {{user.name}}, {{guild.name}}">{embed.get('description', '')}</textarea>
+        <textarea name="embed_description" placeholder="Use {{user.mention}}, {{user.name}}, {{guild.name}}">{escape(embed.get('description') or '')}</textarea>
         <label>Color (hex)</label>
-        <input type="text" name="embed_color" value="#{format(embed.get('color', 0x5865F2), '06x')}" placeholder="5865F2">
+        <input type="text" name="embed_color" value="#{color_to_hex(embed.get('color', DEFAULT_EMBED_COLOR))}" placeholder="5865F2">
         <label>Thumbnail URL</label>
-        <input type="text" name="embed_thumbnail" value="{embed.get('thumbnail', {}).get('url', '') if isinstance(embed.get('thumbnail'), dict) else ''}" placeholder="https://...">
+        <input type="text" name="embed_thumbnail" value="{escape(thumbnail_url)}" placeholder="https://...">
         <label>Footer Text</label>
-        <input type="text" name="embed_footer" value="{embed.get('footer', {}).get('text', '') if isinstance(embed.get('footer'), dict) else ''}" placeholder="Thanks for joining!">
+        <input type="text" name="embed_footer" value="{escape(footer_text)}" placeholder="Thanks for joining!">
         <button class="btn btn-success" type="submit" style="margin-top:0.5rem">Save Settings</button>
       </div>
+      </form>
       """
-    body += "</form>"
     return render_page("Welcome Editor", body, "welcome")
 
 
@@ -397,10 +551,10 @@ def welcome_editor():
 @login_required
 def api_restart():
     try:
-        subprocess.run(
-            ["curl", "-s", "-X", "POST", f"http://127.0.0.1:{BOT_PORT}/restart"],
-            capture_output=True, timeout=5,
-        )
+        req = urllib.request.Request(BOT_RESTART_URL, method="POST")
+        with urllib.request.urlopen(req, timeout=5):
+            pass
+        _health_cache.update(time=0.0, data=None)
         flash("Bot restart signal sent", "success")
     except Exception as e:
         flash(f"Restart failed: {e}", "error")
