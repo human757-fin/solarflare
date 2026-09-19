@@ -211,12 +211,13 @@ async def on_ready():
     if not heartbeat_loop.is_running():
         heartbeat_loop.start()
     try:
-        synced = await bot.tree.sync()
-        log.info("Synced %s slash commands globally", len(synced))
         if DEV_GUILD_ID and bot.get_guild(int(DEV_GUILD_ID)):
             guild = discord.Object(id=int(DEV_GUILD_ID))
-            dev_synced = await bot.tree.sync(guild=guild)
-            log.info("Synced %s slash commands to dev guild", len(dev_synced))
+            bot.tree.copy_global_to(guild=guild)
+            guild_synced = await bot.tree.sync(guild=guild)
+            log.info("Synced %s slash commands to dev guild (instant)", len(guild_synced))
+        synced = await bot.tree.sync()
+        log.info("Synced %s slash commands globally", len(synced))
     except Exception:
         log.exception("Failed to sync slash commands")
 
