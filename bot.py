@@ -213,9 +213,9 @@ async def on_ready():
     try:
         if DEV_GUILD_ID and bot.get_guild(int(DEV_GUILD_ID)):
             guild = discord.Object(id=int(DEV_GUILD_ID))
-            bot.tree.copy_global_to(guild=guild)
-            guild_synced = await bot.tree.sync(guild=guild)
-            log.info("Synced %s slash commands to dev guild (instant)", len(guild_synced))
+            bot.tree.clear_commands(guild=guild)
+            await bot.tree.sync(guild=guild)
+            log.info("Removed stale dev-guild command copies")
         synced = await bot.tree.sync()
         log.info("Synced %s slash commands globally", len(synced))
     except Exception:
