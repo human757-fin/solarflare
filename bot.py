@@ -10,7 +10,7 @@ import aiohttp
 import discord
 from aiohttp import web
 from discord.ext import commands, tasks
-from datetime import datetime
+from datetime import datetime, timezone
 
 import aiomysql
 
@@ -65,7 +65,7 @@ INTENTS.guilds = True
 
 bot = commands.Bot(command_prefix="!", intents=INTENTS)
 bot.db_pool: aiomysql.Pool | None = None
-bot.start_time = datetime.utcnow()
+bot.start_time = datetime.now(timezone.utc)
 
 
 # ---------------------------------------------------------------------------
@@ -272,7 +272,7 @@ async def heartbeat_loop():
                     "title": "Bot Heartbeat",
                     "description": f"Online — {len(bot.guilds)} guilds",
                     "color": 0x00FF00,
-                    "timestamp": datetime.utcnow().isoformat(),
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
                 }]
             }
             try:
@@ -406,7 +406,7 @@ def _health_payload() -> dict:
             for guild in bot.guilds
         ],
         "latency_ms": latency_ms,
-        "uptime_seconds": int((datetime.utcnow() - bot.start_time).total_seconds()),
+        "uptime_seconds": int((datetime.now(timezone.utc) - bot.start_time).total_seconds()),
         "database": bot.db_pool is not None,
         "python": platform.python_version(),
         "discordpy": discord.__version__,
