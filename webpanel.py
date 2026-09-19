@@ -5,7 +5,7 @@ import logging
 import time
 import urllib.error
 import urllib.request
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from flask import (
     Flask,
@@ -280,6 +280,112 @@ def get_bot_stats():
 DEFAULT_EMBED_COLOR = 0x5865F2
 
 
+def _panel_bot_base_url() -> str:
+    """Base URL of the bot's HTTP server (giveaways API)."""
+    base = (BOT_HEALTH_URL or "").rstrip("/")
+    if base.lower().endswith("/health"):
+        base = base[: -len("/health")]
+    return base or f"http://127.0.0.1:{BOT_PORT}"
+
+
+def bot_api(path, method="GET", payload=None, timeout=10):
+    """Call a protected bot endpoint (giveaways API) with the panel token."""
+    url = _panel_bot_base_url() + path
+    data = None
+    headers = {"X-Restart-Token": RESTART_TOKEN}
+    if payload is not None:
+        data = json.dumps(payload).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, method=method, data=data, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            status = resp.status
+            raw = resp.read().decode("utf-8", "replace")
+        try:
+            parsed = json.loads(raw) if raw else {}
+        except Exception:
+            parsed = {}
+        if not isinstance(parsed, dict):
+            parsed = {}
+        ok = status in (200, 201) and parsed.get("status") != "error"
+        return ok, parsed
+    except urllib.error.HTTPError as exc:
+        try:
+            parsed = json.loads(exc.read().decode("utf-8", "replace") or "{}")
+        except Exception:
+            parsed = {}
+        if not isinstance(parsed, dict):
+            parsed = {}
+        return False, {"error": parsed.get("error") or f"HTTP {exc.code}"}
+    except Exception as exc:
+        return False, {"error": str(exc)}
+
+
+def giveaways_from_db() -> list | None:
+    """Read giveaway rows directly; used when the bot API is unreachable."""
+    try:
+        conn = get_db()
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT g.*,
+                           (SELECT COALESCE(SUM(entries), 0)
+                            FROM giveaway_entries e WHERE e.giveaway_id = g.id) AS entries_total
+                    FROM giveaways g
+                    ORDER BY g.ended ASC, g.ends_at IS NULL, g.ends_at ASC
+                    LIMIT 100
+                    """
+                )
+                rows = []
+                for raw in cursor.fetchall():
+                    g = dict(raw)
+                    rows.append(
+                        {
+                            "id": g.get("id"),
+                            "guild_id": g.get("guild_id"),
+                            "guild_name": None,
+                            "channel_id": g.get("channel_id"),
+                            "channel_name": None,
+                            "prize": g.get("prize"),
+                            "winners": g.get("winners"),
+                            "ends_at": (
+                                g.get("ends_at").isoformat() if g.get("ends_at") else None
+                            ),
+                            "ended": bool(g.get("ended")),
+                            "hosted_by": g.get("hosted_by"),
+                            "entries": g.get("entries_total") or 0,
+                            "message_id": g.get("message_id"),
+                            "extra_entries_role_id": g.get("extra_entries_role_id"),
+                            "extra_entries": g.get("extra_entries"),
+                        }
+                    )
+                return rows
+        finally:
+            conn.close()
+    except Exception:
+        return None
+
+
+def fmt_giveaway_ends(iso, ended: bool) -> str:
+    """Human-friendly remaining time for a giveaway end datetime."""
+    if ended or not iso:
+        return "Ended"
+    try:
+        dt = datetime.fromisoformat(str(iso))
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        secs = int((dt - now).total_seconds())
+        if secs <= 0:
+            return "Ended"
+        hours, rem = divmod(secs, 3600)
+        minutes, secs = divmod(rem, 60)
+        if hours:
+            return f"{hours}h {minutes}m"
+        return f"{minutes}m {secs}s"
+    except Exception:
+        return str(iso)
+
+
 def parse_hex_color(value: str, default: int = DEFAULT_EMBED_COLOR) -> int:
     """Parse a ``#RRGGBB`` / ``RRGGBB`` string into an int, falling back to default."""
     try:
@@ -365,6 +471,7 @@ LAYOUT = """<!DOCTYPE html>
 <div class="nav">
   <a href="/" class="{{ 'active' if page=='status' }}">Status</a>
   <a href="/dashboard" class="{{ 'active' if page=='dashboard' }}">Dashboard</a>
+  <a href="/giveaways" class="{{ 'active' if page=='giveaways' }}">Giveaways</a>
   <a href="/welcome-editor" class="{{ 'active' if page=='welcome' }}">Welcome Editor</a>
   <a href="/diagnostics" class="{{ 'active' if page=='diagnostics' }}">Diagnostics</a>
   <a href="/logout" style="margin-left:auto">Logout</a>
@@ -724,6 +831,214 @@ def welcome_editor():
       </form>
       """
     return render_page("Welcome Editor", body, "welcome")
+
+
+# ---------------------------------------------------------------------------
+# Giveaways
+# ---------------------------------------------------------------------------
+
+@app.route("/giveaways", methods=["GET", "POST"])
+@login_required
+def giveaways_page():
+    stats = get_bot_stats()
+    guilds = stats.get("guild_list") or []
+
+    if request.method == "POST":
+        action = request.form.get("action", "")
+        guild_id = request.form.get("guild_id", "").strip()
+        ok, data = False, {"error": "unknown action"}
+        if action == "start":
+            payload = {
+                "guild_id": guild_id,
+                "channel_id": request.form.get("channel_id", "").strip(),
+                "prize": request.form.get("prize", "").strip(),
+                "winners": (request.form.get("winners", "1").strip() or "1"),
+                "duration": (request.form.get("duration", "").strip() or "30m"),
+                "extra_role_id": (request.form.get("extra_role_id", "").strip() or None),
+                "extra_entries": (request.form.get("extra_entries", "1").strip() or "1"),
+            }
+            ok, data = bot_api("/giveaway/start", "POST", payload)
+            if ok:
+                mid = data.get("message_id") or "?"
+                flash(f"Giveaway started (message ID {mid})", "success")
+        elif action == "end":
+            gid = request.form.get("giveaway_id", "").strip()
+            ok, data = bot_api("/giveaway/end", "POST", {"giveaway_id": gid})
+            if ok:
+                flash(f"Giveaway #{gid} ended and winners announced", "success")
+        elif action == "reroll":
+            gid = request.form.get("giveaway_id", "").strip()
+            ok, data = bot_api("/giveaway/reroll", "POST", {"giveaway_id": gid})
+            if ok:
+                flash(f"Giveaway #{gid} rerolled", "success")
+        if not ok:
+            flash(f"Giveaway action failed: {data.get('error')}", "error")
+        query = f"?guild_id={guild_id}" if guild_id else ""
+        return redirect(f"/giveaways{query}")
+
+    selected_guild_id = (request.args.get("guild_id") or "").strip()
+
+    guild_options = '<option value="">— select a guild —</option>'
+    for g in guilds:
+        sel = " selected" if str(g.get("id")) == selected_guild_id else ""
+        guild_options += (
+            f'<option value="{int(g["id"])}"{sel}>'
+            f'{escape(g.get("name") or "Unknown")} ({int(g["id"])})</option>'
+        )
+
+    channels = []
+    roles = []
+    if selected_guild_id:
+        for g in guilds:
+            if str(g.get("id")) == selected_guild_id:
+                channels = g.get("channels") or []
+                roles = g.get("roles") or []
+                break
+
+    channel_options = '<option value="">— select a channel —</option>'
+    if channels:
+        by_category = {}
+        for ch in channels:
+            by_category.setdefault(ch.get("category") or "General", []).append(ch)
+        for category in sorted(by_category, key=str.lower):
+            channel_options += f'<optgroup label="{escape(str(category))}">'
+            for ch in sorted(by_category[category], key=lambda c: str(c.get("name", "")).lower()):
+                channel_options += (
+                    f'<option value="{int(ch["id"])}">'
+                    f'{escape(str(ch.get("name") or "unknown"))}</option>'
+                )
+            channel_options += "</optgroup>"
+    else:
+        channel_options += (
+            '<option value="" disabled>Select a guild to load its channels</option>'
+        )
+
+    role_options = '<option value="">— no extra role —</option>'
+    for r in sorted(roles, key=lambda r: str(r.get("name", "")).lower()):
+        role_options += (
+            f'<option value="{int(r["id"])}">{escape(r.get("name") or "unknown")}</option>'
+        )
+
+    ok, resp = bot_api("/giveaways", "GET", None)
+    items = None
+    source_note = ""
+    if ok and isinstance(resp.get("giveaways"), list):
+        items = resp["giveaways"]
+    else:
+        items = giveaways_from_db()
+        if items is not None:
+            source_note = (
+                '<p style="color:#faa61a">The bot did not answer its API, so this list is read '
+                'directly from the database (channel names not resolved). Start it to enable '
+                'the create/end/reroll buttons.</p>'
+            )
+        else:
+            source_note = (
+                '<p style="color:#f04747">Giveaway list unavailable - the bot is offline and the '
+                'database connection also failed.</p>'
+            )
+
+    rows = ""
+    if items:
+        for g in items:
+            gid = g.get("id")
+            ended = bool(g.get("ended"))
+            status_badge = (
+                '<span style="color:#43b581">Running</span>'
+                if not ended
+                else '<span style="color:#72767d">Ended</span>'
+            )
+            guild_name = g.get("guild_name") or g.get("guild_id")
+            channel_name = g.get("channel_name") or g.get("channel_id")
+            ends = fmt_giveaway_ends(g.get("ends_at"), ended)
+
+            action_forms = ""
+            if not ended:
+                action_forms += (
+                    f'<form method="post" action="/giveaways" style="display:inline">'
+                    f'<input type="hidden" name="guild_id" value="{escape(str(g.get("guild_id") or ""))}">'
+                    f'<input type="hidden" name="giveaway_id" value="{escape(str(gid))}">'
+                    f'<button class="btn btn-danger" name="action" value="end">End</button></form>'
+                )
+            else:
+                action_forms += (
+                    f'<form method="post" action="/giveaways" style="display:inline">'
+                    f'<input type="hidden" name="guild_id" value="{escape(str(g.get("guild_id") or ""))}">'
+                    f'<input type="hidden" name="giveaway_id" value="{escape(str(gid))}">'
+                    f'<button class="btn btn-primary" name="action" value="reroll">Reroll</button></form>'
+                )
+            open_link = ""
+            if g.get("message_id") and g.get("channel_id") and g.get("guild_id"):
+                open_link = (
+                    f' <a target="_blank" rel="noopener" '
+                    f'href="https://discord.com/channels/{int(g["guild_id"])}/{int(g["channel_id"])}/{int(g["message_id"])}">'
+                    f'Open</a>'
+                )
+
+            rows += (
+                "<tr>"
+                f"<td>{escape(str(g.get('prize') or ''))}</td>"
+                f"<td>{escape(str(guild_name))}</td>"
+                f"<td>{escape(str(channel_name))}</td>"
+                f"<td>{g.get('winners', '-')}</td>"
+                f"<td>{g.get('entries', 0)}</td>"
+                f"<td>{escape(ends)}</td>"
+                f"<td>{status_badge}</td>"
+                f"<td>{action_forms} {open_link}</td>"
+                "</tr>"
+            )
+    if not rows:
+        rows = '<tr><td colspan="8" style="color:#72767d">No giveaways yet</td></tr>'
+
+    no_guild_hint = (
+        '<p style="color:#72767d;margin-top:0.25rem">Select a guild above to load its channels.</p>'
+        if not selected_guild_id
+        else ""
+    )
+
+    body = f"""
+    <h1>Giveaways</h1>
+    {source_note}
+    <div class="card">
+      <h2>Start A Giveaway</h2>
+      <form method="get" action="/giveaways">
+        <label>Guild</label>
+        <select name="guild_id" onchange="this.form.submit()">{guild_options}</select>
+      </form>
+      {no_guild_hint}
+      <form method="post" action="/giveaways" style="margin-top:0.75rem">
+        <input type="hidden" name="guild_id" value="{escape(selected_guild_id)}">
+        <input type="hidden" name="action" value="start">
+        <label>Channel</label>
+        <select name="channel_id">{channel_options}</select>
+        <label>Prize</label>
+        <input type="text" name="prize" placeholder="e.g. 100 Nitro" required>
+        <div style="display:flex;gap:0.75rem;flex-wrap:wrap">
+          <div style="flex:1;min-width:140px">
+            <label>Winners</label>
+            <input type="number" name="winners" value="1" min="1">
+          </div>
+          <div style="flex:1;min-width:140px">
+            <label>Duration</label>
+            <input type="text" name="duration" value="30m" placeholder="e.g. 2h30m / 1d / 45m">
+          </div>
+        </div>
+        <label>Extra Entries Role <span style="color:#72767d">(optional)</span></label>
+        <select name="extra_role_id">{role_options}</select>
+        <label>Extra Entries For That Role</label>
+        <input type="number" name="extra_entries" value="1" min="1">
+        <button class="btn btn-success" type="submit" style="margin-top:0.5rem">Start Giveaway</button>
+      </form>
+    </div>
+    <div class="card">
+      <h2>Giveaways</h2>
+      <table>
+        <tr><th>Prize</th><th>Guild</th><th>Channel</th><th>Winners</th><th>Entries</th><th>Ends</th><th>Status</th><th></th></tr>
+        {rows}
+      </table>
+    </div>
+    """
+    return render_page("Giveaways", body, "giveaways")
 
 
 # ---------------------------------------------------------------------------

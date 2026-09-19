@@ -402,6 +402,9 @@ def _health_payload() -> dict:
                     if isinstance(channel, discord.TextChannel)
                     and not isinstance(channel, discord.CategoryChannel)
                 ],
+                "roles": [
+                    {"id": role.id, "name": role.name} for role in guild.roles
+                ],
             }
             for guild in bot.guilds
         ],
@@ -442,10 +445,109 @@ async def restart_handler(request: web.Request) -> web.Response:
     return web.json_response({"status": "restarting"})
 
 
+# ---------------------------------------------------------------------------
+# Giveaways API for the web panel (shares the restart token for auth)
+# ---------------------------------------------------------------------------
+
+async def _authorised(request: web.Request) -> bool:
+    if not RESTART_REQUIRE_TOKEN:
+        return True
+    token = request.headers.get("X-Restart-Token", "")
+    return bool(RESTART_TOKEN) and secrets.compare_digest(token.encode(), RESTART_TOKEN.encode())
+
+
+async def _read_json(request: web.Request):
+    try:
+        return await request.json()
+    except Exception:
+        return None
+
+
+def _giveaways_cog():
+    cog = bot.get_cog("Giveaways")
+    if cog is None:
+        raise RuntimeError("Giveaways cog is not loaded")
+    return cog
+
+
+def _api_error(message: str, status: int = 400) -> web.Response:
+    return web.json_response({"status": "error", "error": message}, status=status)
+
+
+async def giveaways_list_handler(request: web.Request) -> web.Response:
+    if not await _authorised(request):
+        return _api_error("invalid or missing token", 403)
+    try:
+        items = await _giveaways_cog().list_for_panel()
+    except Exception as exc:
+        log.exception("Failed to list giveaways for the panel")
+        return _api_error(str(exc), 503)
+    return web.json_response({"status": "ok", "giveaways": items})
+
+
+async def giveaway_start_handler(request: web.Request) -> web.Response:
+    if not await _authorised(request):
+        return _api_error("invalid or missing token", 403)
+    data = await _read_json(request)
+    if not isinstance(data, dict):
+        return _api_error("invalid JSON body")
+    try:
+        result = await _giveaways_cog().webui_start(
+            guild_id=data.get("guild_id"),
+            channel_id=data.get("channel_id"),
+            prize=data.get("prize", ""),
+            winners=data.get("winners", 1),
+            duration=data.get("duration", "30m"),
+            extra_role_id=data.get("extra_role_id") or None,
+            extra_entries=data.get("extra_entries", 1),
+        )
+    except RuntimeError as exc:
+        return _api_error(str(exc))
+    except Exception as exc:
+        log.exception("Panel giveaway start failed")
+        return _api_error(f"{type(exc).__name__}: {exc}", 500)
+    return web.json_response({"status": "ok", **result})
+
+
+async def _giveaway_id_action(request: web.Request, action: str) -> web.Response:
+    if not await _authorised(request):
+        return _api_error("invalid or missing token", 403)
+    data = await _read_json(request)
+    if not isinstance(data, dict):
+        return _api_error("invalid JSON body")
+    try:
+        gid = int(data.get("giveaway_id") or data.get("id") or 0)
+    except (TypeError, ValueError):
+        return _api_error("giveaway_id is required")
+    try:
+        if action == "end":
+            result = await _giveaways_cog().webui_end(gid)
+        else:
+            result = await _giveaways_cog().webui_reroll(gid)
+    except RuntimeError as exc:
+        return _api_error(str(exc))
+    except Exception as exc:
+        log.exception("Panel giveaway %s failed", action)
+        return _api_error(f"{type(exc).__name__}: {exc}", 500)
+    return web.json_response({"status": "ok", **result})
+
+
+async def giveaway_end_handler(request: web.Request) -> web.Response:
+    return await _giveaway_id_action(request, "end")
+
+
+async def giveaway_reroll_handler(request: web.Request) -> web.Response:
+    return await _giveaway_id_action(request, "reroll")
+
+
 async def start_health_server() -> web.AppRunner:
     app = web.Application()
     app.router.add_get("/health", health_handler)
     app.router.add_post("/restart", restart_handler)
+    app.router.add_post("/giveaway/start", giveaway_start_handler)
+    app.router.add_post("/giveaway/end", giveaway_end_handler)
+    app.router.add_post("/giveaway/reroll", giveaway_reroll_handler)
+    app.router.add_get("/giveaways", giveaways_list_handler)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", BOT_PORT)

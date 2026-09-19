@@ -377,6 +377,205 @@ class Giveaways(commands.Cog):
                 log.exception("Failed to conclude giveaway %s", gid)
 
     # ------------------------------------------------------------------
+    # Web panel API (called by webpanel.py over the bot's HTTP server)
+    # ------------------------------------------------------------------
+
+    async def webui_start(
+        self,
+        guild_id: int,
+        channel_id: int,
+        prize: str,
+        winners: int = 1,
+        duration="30m",
+        extra_role_id: Optional[int] = None,
+        extra_entries: int = 1,
+    ) -> dict:
+        if not self.bot.db_pool:
+            raise RuntimeError("Database is unavailable")
+        if not str(prize or "").strip():
+            raise RuntimeError("Prize is required")
+        guild = self.bot.get_guild(int(guild_id))
+        if not guild:
+            raise RuntimeError("Bot is not in that guild")
+        channel = self.bot.get_channel(int(channel_id))
+        if (
+            not channel
+            or not isinstance(channel, discord.TextChannel)
+            or getattr(channel, "guild", None) is None
+            or channel.guild.id != guild.id
+        ):
+            raise RuntimeError("Channel not found in the selected guild")
+        if isinstance(duration, (int, float)):
+            secs = int(duration)
+        else:
+            secs = parse_duration(str(duration))
+        if not secs or secs <= 0:
+            raise RuntimeError("Invalid duration - use something like 2h30m, 1d or 45m")
+        winners = max(1, int(winners))
+        extra_role = None
+        if extra_role_id:
+            extra_role = guild.get_role(int(extra_role_id))
+        extra = int(extra_entries or 1) if extra_role else 0
+        ends_at = utcnow() + timedelta(seconds=secs)
+        hosted_by = self.bot.user.id if self.bot.user else 0
+
+        async with self.bot.db_pool.acquire() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    INSERT INTO giveaways (guild_id, channel_id, message_id, prize, winners,
+                                           ends_at, hosted_by, extra_entries_role_id, extra_entries, ended)
+                    VALUES (%s, %s, 0, %s, %s, %s, %s, %s, %s, 0)
+                    """,
+                    (
+                        guild.id,
+                        channel.id,
+                        prize,
+                        winners,
+                        ends_at,
+                        hosted_by,
+                        extra_role.id if extra_role else None,
+                        extra,
+                    ),
+                )
+                gid = cur.lastrowid
+
+        embed = await self._build_embed(
+            {
+                "id": gid,
+                "prize": prize,
+                "winners": winners,
+                "ended": False,
+                "hosted_by": hosted_by,
+                "ends_at": ends_at,
+                "extra_entries_role_id": extra_role.id if extra_role else None,
+                "extra_entries": extra,
+            },
+            0,
+        )
+        try:
+            msg = await channel.send(embed=embed, view=GiveawayView(gid, self.bot))
+        except discord.Forbidden:
+            raise RuntimeError("The bot cannot send messages in that channel")
+        async with self.bot.db_pool.acquire() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "UPDATE giveaways SET message_id=%s WHERE id=%s", (msg.id, gid)
+                )
+        return {"id": gid, "message_id": msg.id, "ends_at": ends_at.isoformat()}
+
+    async def webui_end(self, giveaway_id: int) -> dict:
+        if not self.bot.db_pool:
+            raise RuntimeError("Database is unavailable")
+        gid = int(giveaway_id)
+        async with self.bot.db_pool.acquire() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute("SELECT id FROM giveaways WHERE id=%s", (gid,))
+                if not await cur.fetchone():
+                    raise RuntimeError("Giveaway not found")
+                await cur.execute(
+                    "UPDATE giveaways SET ends_at=%s WHERE id=%s", (utcnow(), gid)
+                )
+        await self._conclude(gid)
+        return {"ended": True}
+
+    async def webui_reroll(self, giveaway_id: int) -> dict:
+        if not self.bot.db_pool:
+            raise RuntimeError("Database is unavailable")
+        gid = int(giveaway_id)
+        async with self.bot.db_pool.acquire() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute("SELECT * FROM giveaways WHERE id=%s", (gid,))
+                row = await cur.fetchone()
+                if not row:
+                    raise RuntimeError("Giveaway not found")
+                cols = [d[0] for d in cur.description]
+                giveaway = dict(zip(cols, row))
+                if not giveaway["ended"]:
+                    raise RuntimeError("Giveaway is still running - end it first")
+                await cur.execute(
+                    "SELECT user_id FROM giveaway_winners WHERE giveaway_id=%s", (gid,)
+                )
+                previous = {r[0] for r in await cur.fetchall()}
+                new_winners = await self._pick_winners(
+                    conn, gid, giveaway["winners"], previous
+                )
+                for uid in new_winners:
+                    await cur.execute(
+                        "INSERT IGNORE INTO giveaway_winners (giveaway_id, user_id) VALUES (%s, %s)",
+                        (gid, uid),
+                    )
+                await cur.execute(
+                    "SELECT COALESCE(SUM(entries), 0) FROM giveaway_entries WHERE giveaway_id=%s",
+                    (gid,),
+                )
+                total_entries = (await cur.fetchone())[0]
+
+        channel = self.bot.get_channel(giveaway["channel_id"])
+        embed = await self._build_embed(giveaway, total_entries, new_winners)
+        if channel:
+            try:
+                msg = await channel.fetch_message(giveaway["message_id"])
+                await msg.edit(embed=embed, view=GiveawayView(gid, self.bot, ended=True))
+            except Exception:
+                log.warning("Could not update giveaway message %s after reroll", gid)
+            if new_winners:
+                mentions = " ".join(f"<@{uid}>" for uid in new_winners)
+                try:
+                    await channel.send(
+                        f"🎉 **New winner(s)**: {mentions} for **{giveaway['prize']}**!"
+                    )
+                except Exception:
+                    pass
+            else:
+                try:
+                    await channel.send("No entries available to reroll. 😕")
+                except Exception:
+                    pass
+        return {"rerolled": True, "winners": len(new_winners)}
+
+    async def list_for_panel(self) -> list:
+        if not self.bot.db_pool:
+            raise RuntimeError("Database is unavailable")
+        items = []
+        async with self.bot.db_pool.acquire() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    SELECT g.*,
+                           (SELECT COALESCE(SUM(entries), 0)
+                            FROM giveaway_entries e WHERE e.giveaway_id = g.id) AS entries_total
+                    FROM giveaways g
+                    ORDER BY g.ended ASC, g.ends_at IS NULL, g.ends_at ASC
+                    LIMIT 100
+                    """
+                )
+                cols = [d[0] for d in cur.description]
+                for row in await cur.fetchall():
+                    g = dict(zip(cols, row))
+                    channel = self.bot.get_channel(g["channel_id"])
+                    guild = self.bot.get_guild(g["guild_id"])
+                    items.append(
+                        {
+                            "id": g["id"],
+                            "guild_id": g["guild_id"],
+                            "guild_name": guild.name if guild else None,
+                            "channel_id": g["channel_id"],
+                            "channel_name": channel.name if channel else None,
+                            "prize": g["prize"],
+                            "winners": g["winners"],
+                            "ends_at": g["ends_at"].isoformat() if g["ends_at"] else None,
+                            "ended": bool(g["ended"]),
+                            "hosted_by": g["hosted_by"],
+                            "entries": g["entries_total"],
+                            "message_id": g["message_id"],
+                            "extra_entries_role_id": g["extra_entries_role_id"],
+                            "extra_entries": g["extra_entries"],
+                        }
+                    )
+        return items
+
+    # ------------------------------------------------------------------
     # Commands
     # ------------------------------------------------------------------
 
