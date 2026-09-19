@@ -246,7 +246,7 @@ async def on_member_join(member: discord.Member):
     try:
         embed = build_welcome_embed(settings.get("welcome_embed"), member)
         if embed is not None:
-            await channel.send(member.mention, embed=embed)
+            await channel.send(embed=embed)
             return
 
         msg = apply_welcome_placeholders(
