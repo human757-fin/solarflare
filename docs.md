@@ -110,13 +110,17 @@ connectivity is unaffected).
 
 ## Welcome System
 
-Placeholders: `{user.mention}`, `{user.name}`, `{guild.name}` — they are replaced
-in the welcome message and in the embed title, description and footer.
+Placeholders: `{user.mention}`, `{user.name}`, `{user.avatar}`, `{guild.name}`, `{guild.icon}`
+— they are replaced in the welcome message and in the embed title, description,
+footer, thumbnail and image (banner). `{user.avatar}` is great for the image/thumbnail.
 
 - If a guild has a `welcome_embed` set, it sends that embed
 - Otherwise falls back to `welcome_message` text
 - Configure via `/welcome-editor` in the web panel: pick a guild with **Load**,
   then save with **Save Settings**
+- The channel picker is a dropdown of the guild's text channels (grouped by category),
+  fetched from the bot's health endpoint; the embed editor has both a thumbnail and
+  a large image field
 
 ## Cogs
 

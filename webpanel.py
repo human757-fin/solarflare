@@ -570,6 +570,7 @@ def welcome_editor():
         embed_description = request.form.get("embed_description", "").strip()
         embed_color = request.form.get("embed_color", "").strip()
         embed_thumbnail = request.form.get("embed_thumbnail", "").strip()
+        embed_image = request.form.get("embed_image", "").strip()
         embed_footer = request.form.get("embed_footer", "").strip()
 
         if welcome_channel and not welcome_channel.isdigit():
@@ -577,7 +578,7 @@ def welcome_editor():
             return redirect(f"/welcome-editor?guild_id={guild_id}")
 
         embed_data = None
-        if embed_title or embed_description or embed_thumbnail or embed_footer:
+        if embed_title or embed_description or embed_thumbnail or embed_image or embed_footer:
             embed_data = {
                 "title": embed_title,
                 "description": embed_description,
@@ -585,6 +586,8 @@ def welcome_editor():
             }
             if embed_thumbnail:
                 embed_data["thumbnail"] = {"url": embed_thumbnail}
+            if embed_image:
+                embed_data["image"] = {"url": embed_image}
             if embed_footer:
                 embed_data["footer"] = {"text": embed_footer}
 
@@ -644,6 +647,8 @@ def welcome_editor():
 
     thumbnail = embed.get("thumbnail")
     thumbnail_url = thumbnail.get("url", "") if isinstance(thumbnail, dict) else ""
+    image = embed.get("image")
+    image_url = image.get("url", "") if isinstance(image, dict) else ""
     footer = embed.get("footer")
     footer_text = footer.get("text", "") if isinstance(footer, dict) else ""
 
@@ -662,13 +667,41 @@ def welcome_editor():
     """
 
     if guild_id:
+        guild_info = next(
+            (
+                g for g in get_bot_stats()["guild_list"]
+                if str(g.get("id")) == str(guild_id)
+            ),
+            None,
+        )
+        channels = (guild_info or {}).get("channels") or []
+        by_category = {}
+        for ch in channels:
+            by_category.setdefault(ch.get("category") or "General", []).append(ch)
+        options = '<option value="">— no channel —</option>'
+        for category in sorted(by_category, key=str.lower):
+            options += f'<optgroup label="{escape(str(category))}">'
+            for ch in sorted(by_category[category], key=lambda c: str(c.get("name", "")).lower()):
+                selected = ' selected' if str(ch.get("id")) == str(wc) else ''
+                options += (
+                    f'<option value="{int(ch["id"])}"{selected}>'
+                    f'{escape(str(ch.get("name") or "unknown"))}'
+                    f'</option>'
+                )
+            options += "</optgroup>"
+        if not channels:
+            options += (
+                '<option value="" disabled>No text channels reported — '
+                'is the bot connected to this guild?</option>'
+            )
+
         body += f"""
       <form method="post" action="/welcome-editor">
       <input type="hidden" name="guild_id" value="{escape(guild_id)}">
       <div class="card">
         <h2>Channel</h2>
-        <label>Welcome Channel ID</label>
-        <input type="number" name="welcome_channel_id" value="{escape(wc)}" placeholder="Channel ID">
+        <label>Welcome Channel</label>
+        <select name="welcome_channel_id">{options}</select>
         <label>Default Welcome Message (used if no embed)</label>
         <input type="text" name="welcome_message" value="{escape(wm)}" placeholder="Welcome {{user.mention}} to {{guild.name}}!">
       </div>
@@ -677,11 +710,13 @@ def welcome_editor():
         <label>Title</label>
         <input type="text" name="embed_title" value="{escape(embed.get('title') or '')}" placeholder="Welcome!">
         <label>Description</label>
-        <textarea name="embed_description" placeholder="Use {{user.mention}}, {{user.name}}, {{guild.name}}">{escape(embed.get('description') or '')}</textarea>
+        <textarea name="embed_description" placeholder="Use {{user.mention}}, {{user.name}}, {{user.avatar}}, {{guild.name}}, {{guild.icon}}">{escape(embed.get('description') or '')}</textarea>
         <label>Color (hex)</label>
         <input type="text" name="embed_color" value="#{color_to_hex(embed.get('color', DEFAULT_EMBED_COLOR))}" placeholder="5865F2">
         <label>Thumbnail URL</label>
-        <input type="text" name="embed_thumbnail" value="{escape(thumbnail_url)}" placeholder="https://...">
+        <input type="text" name="embed_thumbnail" value="{escape(thumbnail_url)}" placeholder="https://... or {{user.avatar}}">
+        <label>Image URL <span style="color:#72767d">(large banner image)</span></label>
+        <input type="text" name="embed_image" value="{escape(image_url)}" placeholder="https://... or {{user.avatar}}">
         <label>Footer Text</label>
         <input type="text" name="embed_footer" value="{escape(footer_text)}" placeholder="Thanks for joining!">
         <button class="btn btn-success" type="submit" style="margin-top:0.5rem">Save Settings</button>

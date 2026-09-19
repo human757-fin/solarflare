@@ -147,7 +147,9 @@ def apply_welcome_placeholders(template: str, member: discord.Member) -> str:
     return (
         template.replace("{user.mention}", member.mention)
         .replace("{user.name}", member.name)
+        .replace("{user.avatar}", member.display_avatar.url)
         .replace("{guild.name}", member.guild.name)
+        .replace("{guild.icon}", member.guild.icon.url if member.guild.icon else "")
     )
 
 
@@ -180,6 +182,14 @@ def build_welcome_embed(raw_embed, member: discord.Member) -> discord.Embed | No
         embed.set_footer(
             text=apply_welcome_placeholders(footer.text, member),
             icon_url=footer.icon_url,
+        )
+    if embed.thumbnail and embed.thumbnail.url:
+        embed.set_thumbnail(
+            url=apply_welcome_placeholders(embed.thumbnail.url, member)
+        )
+    if embed.image and embed.image.url:
+        embed.set_image(
+            url=apply_welcome_placeholders(embed.image.url, member)
         )
     return embed
 
@@ -378,6 +388,20 @@ def _health_payload() -> dict:
                 "name": guild.name,
                 "member_count": guild.member_count,
                 "icon": str(guild.icon.url) if guild.icon else None,
+                "channels": [
+                    {
+                        "id": channel.id,
+                        "name": channel.name,
+                        "category": (
+                            channel.category.name
+                            if getattr(channel, "category", None)
+                            else None
+                        ),
+                    }
+                    for channel in guild.channels
+                    if isinstance(channel, discord.TextChannel)
+                    and not isinstance(channel, discord.CategoryChannel)
+                ],
             }
             for guild in bot.guilds
         ],
