@@ -3,6 +3,7 @@ import json
 import secrets
 import logging
 import time
+import urllib.error
 import urllib.request
 from datetime import datetime, timedelta
 
@@ -28,10 +29,11 @@ WEBUI_PASSWORD = os.environ.get("WEBUI_PASSWORD", "changeme")
 BOT_TOKEN = os.environ.get("DISCORD_TOKEN", "")
 BOT_PY_FILE = os.environ.get("BOT_PY_FILE", "bot.py")
 WEB_PORT = int(os.environ.get("WEB_PORT", 2040))
-BOT_PORT = int(os.environ.get("BOT_PORT", 2067))
+BOT_PORT = int(os.environ.get("BOT_PORT") or os.environ.get("HEALTH_PORT") or 2067)
 WEBUI_SECURE_COOKIE = os.environ.get("WEBUI_SECURE_COOKIE", "0") == "1"
 
-BOT_HEALTH_URL = os.environ.get("BOT_HEALTH_URL", f"http://127.0.0.1:{BOT_PORT}/health")
+# Optional explicit override; when empty the panel probes common localhost URLs.
+BOT_HEALTH_URL = os.environ.get("BOT_HEALTH_URL", "")
 BOT_RESTART_URL = os.environ.get("BOT_RESTART_URL", f"http://127.0.0.1:{BOT_PORT}/restart")
 
 DB_HOST = os.environ.get("DB_HOST", "127.0.0.1")
@@ -43,6 +45,24 @@ DB_SSL = os.environ.get("DB_SSL", "0") == "1"
 
 log = logging.getLogger("webpanel")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+
+
+def get_code_revision(base_dir: str = "") -> str:
+    """Best-effort short git revision of the deployed code (no git binary needed)."""
+    root = base_dir or os.path.dirname(os.path.abspath(__file__))
+    try:
+        with open(os.path.join(root, ".git", "HEAD"), "r", encoding="utf-8") as fh:
+            head = fh.read().strip()
+        if head.startswith("ref:"):
+            ref_parts = head.split(" ", 1)[1].strip().split("/")
+            with open(os.path.join(root, ".git", *ref_parts), "r", encoding="utf-8") as fh:
+                head = fh.read().strip()
+        return head[:7] or "unknown"
+    except Exception:
+        return "unknown"
+
+
+PANEL_REVISION = get_code_revision()
 
 
 def get_db():
@@ -60,27 +80,73 @@ def get_db():
     return conn, loop
 
 
-_health_cache = {"time": 0.0, "data": None}
+_health_cache = {"time": 0.0, "data": None, "url": None, "error": None}
 HEALTH_CACHE_SECONDS = 5
+# Failed probes are cached longer so an offline bot does not slow every page load.
+HEALTH_FAIL_CACHE_SECONDS = 15
 
 
-def fetch_bot_health(timeout=2):
+def reset_health_cache():
+    """Forget cached probe results so the next request re-checks immediately."""
+    _health_cache.update(time=0.0, data=None, url=None, error=None)
+
+
+def health_candidates() -> list:
+    """URLs to probe, in order. Explicit override first, then common localhost forms."""
+    candidates = []
+    if BOT_HEALTH_URL:
+        candidates.append(BOT_HEALTH_URL)
+    for host in ("127.0.0.1", "localhost"):
+        url = f"http://{host}:{BOT_PORT}/health"
+        if url not in candidates:
+            candidates.append(url)
+    return candidates
+
+
+def fetch_bot_health(timeout=2, force=False):
     """Read the bot's /health endpoint. Returns the payload, or None when offline."""
     now = time.time()
-    if now - _health_cache["time"] < HEALTH_CACHE_SECONDS:
-        return _health_cache["data"]
+    age = now - _health_cache["time"]
+    if not force:
+        if _health_cache["data"] is not None and age < HEALTH_CACHE_SECONDS:
+            return _health_cache["data"]
+        if _health_cache["data"] is None and age < HEALTH_FAIL_CACHE_SECONDS:
+            return None
 
     data = None
-    try:
-        with urllib.request.urlopen(BOT_HEALTH_URL, timeout=timeout) as resp:
-            if resp.status == 200:
-                data = json.loads(resp.read().decode("utf-8") or "{}")
-    except Exception:
-        pass
+    working_url = None
+    errors = []
+    for candidate in health_candidates():
+        try:
+            with urllib.request.urlopen(candidate, timeout=timeout) as resp:
+                if resp.status == 200:
+                    data = json.loads(resp.read().decode("utf-8") or "{}")
+                    working_url = candidate
+                    break
+                errors.append(f"{candidate} -> HTTP {resp.status}")
+        except urllib.error.HTTPError as exc:
+            errors.append(f"{candidate} -> HTTP {exc.code}")
+        except Exception as exc:
+            errors.append(f"{candidate} -> {exc}")
 
-    # Connection is closed by urlopen returning; only the result matters here.
-    _health_cache.update(time=now, data=data)
+    error = None if data else "; ".join(errors)
+    if error:
+        log.warning("Bot health check failed: %s", error)
+    _health_cache.update(time=now, data=data, url=working_url, error=error)
     return data
+
+
+def check_database():
+    """Return (status, error) for the panel's own database connection."""
+    try:
+        conn, loop = get_db()
+        cursor = loop.run_until_complete(conn.cursor())
+        loop.run_until_complete(cursor.execute("SELECT 1"))
+        conn.close()
+        loop.close()
+        return "connected", None
+    except Exception as exc:
+        return "unavailable", str(exc)
 
 
 def get_db_guild_count():
@@ -128,6 +194,10 @@ def get_bot_stats():
             "uptime_seconds": health.get("uptime_seconds"),
             "database": bool(health.get("database")),
             "source": "bot",
+            "revision": health.get("revision"),
+            "bot_port": health.get("port"),
+            "health_url": _health_cache.get("url"),
+            "health_error": None,
         }
 
     db_guilds = get_db_guild_count()
@@ -141,6 +211,10 @@ def get_bot_stats():
         "uptime_seconds": None,
         "database": db_guilds is not None,
         "source": "db",
+        "revision": None,
+        "bot_port": None,
+        "health_url": None,
+        "health_error": _health_cache.get("error"),
     }
 
 
@@ -233,6 +307,7 @@ LAYOUT = """<!DOCTYPE html>
   <a href="/" class="{{ 'active' if page=='status' }}">Status</a>
   <a href="/dashboard" class="{{ 'active' if page=='dashboard' }}">Dashboard</a>
   <a href="/welcome-editor" class="{{ 'active' if page=='welcome' }}">Welcome Editor</a>
+  <a href="/diagnostics" class="{{ 'active' if page=='diagnostics' }}">Diagnostics</a>
   <a href="/logout" style="margin-left:auto">Logout</a>
 </div>
 {% with messages = get_flashed_messages(with_categories=true) %}
@@ -259,6 +334,8 @@ def render_page(title, body, page=""):
 
 @app.route("/")
 def status():
+    if request.args.get("recheck"):
+        reset_health_cache()
     stats = get_bot_stats()
     status_class = f"status-{stats['status']}"
     guild_label = "Guilds" if stats["status"] == "online" else "Configured Guilds"
@@ -269,13 +346,17 @@ def status():
       <p>Gateway: <code>{'ready' if stats['ready'] else 'connecting'}</code></p>
       <p>Latency: <code>{stats['latency_ms'] if stats['latency_ms'] is not None else 'n/a'} ms</code></p>
       <p>Uptime: <code>{format_uptime(stats['uptime_seconds'])}</code></p>
-      <p>Database: <code>{'connected' if stats['database'] else 'unavailable'}</code></p>
+      <p>Database (bot): <code>{'connected' if stats['database'] else 'unavailable'}</code></p>
+      <p>Bot revision: <code>{escape(str(stats['revision'] or 'not reported'))}</code></p>
+      <p>Answered on: <code>{escape(str(stats['health_url'] or '-'))}</code></p>
         """
     else:
-        health_details = """
-      <p>No response from the bot's health endpoint, so the guild count falls back
-      to the number of stored guild settings.</p>
-      <p>Check the Pterodactyl console and that the bot listens on the health port.</p>
+        health_details = f"""
+      <p>The bot did not answer its health endpoint, so the numbers above fall back
+      to how many guild settings are stored.</p>
+      <p>Probed: <code>{escape(', '.join(health_candidates()))}</code></p>
+      <p>Last error: <code>{escape(str(stats['health_error'] or 'unknown'))}</code></p>
+      <p><a href="/diagnostics?recheck=1">Open Diagnostics</a> (re-checks the bot now).</p>
         """
 
     body = f"""
@@ -287,7 +368,6 @@ def status():
     <div class="card" style="margin-top:1rem">
       <h2>Health Check</h2>
       {health_details}
-      <p>Endpoint: <code>{escape(BOT_HEALTH_URL)}</code></p>
     </div>
     <div class="card">
       <h2>System</h2>
@@ -544,6 +624,105 @@ def welcome_editor():
 
 
 # ---------------------------------------------------------------------------
+# Diagnostics
+# ---------------------------------------------------------------------------
+
+@app.route("/diagnostics")
+@login_required
+def diagnostics():
+    if request.args.get("recheck"):
+        reset_health_cache()
+    stats = get_bot_stats()
+    panel_db_status, panel_db_error = check_database()
+
+    def env_row(name):
+        value = os.environ.get(name, "")
+        return (
+            f"<tr><td><code>{escape(name)}</code></td>"
+            f"<td><code>{escape(value) if value else 'not set'}</code></td></tr>"
+        )
+
+    guild_rows = ""
+    for guild in stats["guild_list"]:
+        guild_rows += (
+            f"<tr><td>{escape(guild.get('name') or 'Unknown')}</td>"
+            f"<td>{int(guild['id'])}</td><td>{guild.get('member_count', '-')}</td></tr>"
+        )
+    if not guild_rows:
+        guild_rows = '<tr><td colspan="3" style="color:#72767d">No guild data reported by the bot</td></tr>'
+
+    online = stats["status"] == "online"
+    health_colour = "#3ba55c" if online else "#ed4245"
+    port_match = (
+        "-" if not online
+        else ("yes" if str(stats["bot_port"]) == str(BOT_PORT) else "NO - panel and bot disagree")
+    )
+    restart_hint = (
+        '<form method="post" action="/api/restart"><button class="btn btn-danger">Restart Bot</button></form>'
+        if online else
+        '<p style="color:#faa61a">The bot process is not answering, so the restart endpoint '
+        'cannot be reached from here. Restart it from the Pterodactyl panel, then reload this page.</p>'
+    )
+
+    body = f"""
+    <h1>Diagnostics</h1>
+    <div class="card">
+      <h2>Bot Health Endpoint</h2>
+      <p style="font-size:1.2rem">Result: <strong style="color:{health_colour}">{'REACHABLE' if online else 'UNREACHABLE'}</strong></p>
+      <p>Probed URLs: <code>{escape(', '.join(health_candidates()))}</code></p>
+      <p>Answered on: <code>{escape(str(stats['health_url'] or '-'))}</code></p>
+      <p>Last error: <code>{escape(str(stats['health_error'] or '-'))}</code></p>
+      <p><a href="/diagnostics?recheck=1">Recheck now</a></p>
+      <div style="margin-top:0.5rem">{restart_hint}</div>
+    </div>
+    <div class="card">
+      <h2>Versions And Ports</h2>
+      <table>
+        <tr><th>Item</th><th>Value</th></tr>
+        <tr><td>Panel revision</td><td><code>{escape(PANEL_REVISION)}</code></td></tr>
+        <tr><td>Bot revision</td><td><code>{escape(str(stats['revision'] or 'not reported'))}</code></td></tr>
+        <tr><td>Panel BOT_PORT</td><td><code>{BOT_PORT}</code></td></tr>
+        <tr><td>Bot BOT_PORT</td><td><code>{escape(str(stats['bot_port'] if stats['bot_port'] is not None else '-'))}</code></td></tr>
+        <tr><td>Ports match</td><td><code>{port_match}</code></td></tr>
+        <tr><td>Restart URL</td><td><code>{escape(BOT_RESTART_URL)}</code></td></tr>
+        <tr><td>Panel port</td><td><code>{WEB_PORT}</code></td></tr>
+      </table>
+      <p style="color:#72767d;margin-top:0.5rem">If the bot revision is older than the panel revision,
+      the server has not pulled the latest code yet - restart it from Pterodactyl.</p>
+    </div>
+    <div class="card">
+      <h2>Databases</h2>
+      <table>
+        <tr><th>Check</th><th>Value</th></tr>
+        <tr><td>Panel connection</td><td><code>{escape(panel_db_status)}</code></td></tr>
+        <tr><td>Panel error</td><td><code>{escape(panel_db_error or '-')}</code></td></tr>
+        <tr><td>Bot connection</td><td><code>{'connected' if stats['database'] else ('unknown' if stats['health_error'] else 'unavailable')}</code></td></tr>
+      </table>
+    </div>
+    <div class="card">
+      <h2>Guilds Reported By The Bot ({stats['guilds']})</h2>
+      <table>
+        <tr><th>Name</th><th>ID</th><th>Members</th></tr>
+        {guild_rows}
+      </table>
+      <p style="color:#72767d;margin-top:0.5rem">A count of 0 while the endpoint is reachable means the
+      bot is connected but Discord has not sent its guild list yet (or the Members/Guilds intent is off).</p>
+    </div>
+    <div class="card">
+      <h2>Relevant Environment</h2>
+      <table>
+        <tr><th>Variable</th><th>Value</th></tr>
+        {env_row('BOT_PORT')}{env_row('HEALTH_PORT')}{env_row('BOT_HEALTH_URL')}{env_row('BOT_RESTART_URL')}
+        {env_row('BOT_PY_FILE')}{env_row('WEB_PORT')}{env_row('DATABASE_ENGINE')}{env_row('DB_HOST')}
+        {env_row('DB_PORT')}{env_row('DB_NAME')}{env_row('DB_USER')}{env_row('DB_SSL')}{env_row('LOG_LEVEL')}
+      </table>
+      <p style="color:#72767d;margin-top:0.5rem">Secrets (tokens and passwords) are never shown here.</p>
+    </div>
+    """
+    return render_page("Diagnostics", body, "diagnostics")
+
+
+# ---------------------------------------------------------------------------
 # API routes
 # ---------------------------------------------------------------------------
 
@@ -554,7 +733,7 @@ def api_restart():
         req = urllib.request.Request(BOT_RESTART_URL, method="POST")
         with urllib.request.urlopen(req, timeout=5):
             pass
-        _health_cache.update(time=0.0, data=None)
+        _health_cache.update(time=0.0, data=None, url=None, error=None)
         flash("Bot restart signal sent", "success")
     except Exception as e:
         flash(f"Restart failed: {e}", "error")
@@ -563,6 +742,8 @@ def api_restart():
 
 @app.route("/api/status")
 def api_status():
+    if request.args.get("recheck"):
+        reset_health_cache()
     stats = get_bot_stats()
     return stats
 

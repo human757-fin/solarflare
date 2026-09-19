@@ -23,10 +23,31 @@ DB_PASSWORD = os.environ.get("DB_PASSWORD")
 DB_NAME = os.environ.get("DB_NAME")
 DB_SSL = os.environ.get("DB_SSL", "0") == "1"
 DATABASE_ENGINE = os.environ.get("DATABASE_ENGINE", "mysql")
-BOT_PORT = int(os.environ.get("BOT_PORT", 2067))
+BOT_PORT = int(os.environ.get("BOT_PORT") or os.environ.get("HEALTH_PORT") or 2067)
 DEV_GUILD_ID = os.environ.get("DEV_GUILD_ID", "")
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "")
 GIT_ADDRESS = os.environ.get("GIT_ADDRESS", "")
+
+
+def get_code_revision(base_dir: str = "") -> str:
+    """Best-effort short git revision of the deployed code (no git binary needed).
+
+    Lets the web panel confirm which commit the bot is actually running.
+    """
+    root = base_dir or os.path.dirname(os.path.abspath(__file__))
+    try:
+        with open(os.path.join(root, ".git", "HEAD"), "r", encoding="utf-8") as fh:
+            head = fh.read().strip()
+        if head.startswith("ref:"):
+            ref_parts = head.split(" ", 1)[1].strip().split("/")
+            with open(os.path.join(root, ".git", *ref_parts), "r", encoding="utf-8") as fh:
+                head = fh.read().strip()
+        return head[:7] or "unknown"
+    except Exception:
+        return "unknown"
+
+
+CODE_REVISION = get_code_revision()
 
 INTENTS = discord.Intents.default()
 INTENTS.message_content = True
@@ -328,6 +349,8 @@ async def health_handler(request: web.Request) -> web.Response:
     payload = {
         "status": "ok",
         "ready": bot.is_ready,
+        "revision": CODE_REVISION,
+        "port": BOT_PORT,
         "user": str(bot.user) if bot.user else None,
         "user_id": bot.user.id if bot.user else None,
         "guilds": len(bot.guilds),
@@ -374,14 +397,26 @@ async def main():
     if not BOT_TOKEN:
         log.error("DISCORD_TOKEN environment variable is not set")
         return
-    await init_db()
-    runner = await start_health_server()
+    log.info("Solarflare bot starting (revision %s)", CODE_REVISION)
+
+    # Neither the database nor the health port may stop the bot from running.
+    try:
+        await init_db()
+    except Exception:
+        log.exception("Database unavailable - welcome settings cannot be stored or read")
+    try:
+        runner = await start_health_server()
+    except Exception:
+        log.exception("Health server could not bind port %s - the web panel will show OFFLINE", BOT_PORT)
+        runner = None
+
     try:
         async with bot:
             await load_cogs()
             await bot.start(BOT_TOKEN)
     finally:
-        await runner.cleanup()
+        if runner is not None:
+            await runner.cleanup()
 
 
 if __name__ == "__main__":
