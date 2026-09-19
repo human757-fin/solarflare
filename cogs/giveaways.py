@@ -124,8 +124,34 @@ class Giveaways(commands.Cog):
         self._views_registered = False
 
     async def cog_load(self):
-        if not self.bot.db_pool:
-            return
+        # Table creation must never prevent the cog from registering its commands.
+        if self.bot.db_pool:
+            try:
+                await self._ensure_tables()
+                await self._create_tables()
+            except Exception:
+                log.exception("Failed to create giveaway tables")
+
+    async def _ensure_tables(self):
+        # Legacy: the first release created FK-constrained tables that some
+        # MySQL/MariaDB collations reject (errno 150). Drop them so the plain
+        # schema below can be created cleanly on the next boot.
+        async with self.bot.db_pool.acquire() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT COUNT(*) FROM information_schema.REFERENTIAL_CONSTRAINTS "
+                    "WHERE CONSTRAINT_SCHEMA = DATABASE() "
+                    "AND CONSTRAINT_NAME IN ('fk_giveaway_entries', 'fk_giveaway_winners')"
+                )
+                row = await cur.fetchone()
+                if row and row[0]:
+                    await cur.execute("SET FOREIGN_KEY_CHECKS = 0")
+                    await cur.execute("DROP TABLE IF EXISTS giveaway_winners")
+                    await cur.execute("DROP TABLE IF EXISTS giveaway_entries")
+                    await cur.execute("DROP TABLE IF EXISTS giveaways")
+                    await cur.execute("SET FOREIGN_KEY_CHECKS = 1")
+
+    async def _create_tables(self):
         async with self.bot.db_pool.acquire() as conn:
             async with conn.cursor() as cur:
                 await cur.execute("""
@@ -145,7 +171,7 @@ class Giveaways(commands.Cog):
                         PRIMARY KEY (id),
                         KEY idx_active (ended, ends_at),
                         KEY idx_message (message_id)
-                    ) ENGINE=InnoDB
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
                 """)
                 await cur.execute("""
                     CREATE TABLE IF NOT EXISTS giveaway_entries (
@@ -153,18 +179,16 @@ class Giveaways(commands.Cog):
                         user_id BIGINT UNSIGNED NOT NULL,
                         entries INT UNSIGNED NOT NULL DEFAULT 1,
                         PRIMARY KEY (giveaway_id, user_id),
-                        CONSTRAINT fk_giveaway_entries FOREIGN KEY (giveaway_id)
-                            REFERENCES giveaways(id) ON DELETE CASCADE
-                    ) ENGINE=InnoDB
+                        KEY idx_entries_gw (giveaway_id)
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
                 """)
                 await cur.execute("""
                     CREATE TABLE IF NOT EXISTS giveaway_winners (
                         giveaway_id INT UNSIGNED NOT NULL,
                         user_id BIGINT UNSIGNED NOT NULL,
                         PRIMARY KEY (giveaway_id, user_id),
-                        CONSTRAINT fk_giveaway_winners FOREIGN KEY (giveaway_id)
-                            REFERENCES giveaways(id) ON DELETE CASCADE
-                    ) ENGINE=InnoDB
+                        KEY idx_winners_gw (giveaway_id)
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
                 """)
 
     @commands.Cog.listener()

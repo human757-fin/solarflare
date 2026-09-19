@@ -29,27 +29,31 @@ class Levels(commands.Cog):
         self._cooldowns = {}
 
     async def cog_load(self):
+        # A DB failure must never stop the cog from registering commands.
         if not self.bot.db_pool:
             return
-        async with self.bot.db_pool.acquire() as conn:
-            async with conn.cursor() as cur:
-                await cur.execute("""
-                    CREATE TABLE IF NOT EXISTS levels (
-                        user_id BIGINT UNSIGNED NOT NULL,
-                        guild_id BIGINT UNSIGNED NOT NULL,
-                        xp BIGINT UNSIGNED NOT NULL DEFAULT 0,
-                        level INT UNSIGNED NOT NULL DEFAULT 1,
-                        PRIMARY KEY (user_id, guild_id)
-                    )
-                """)
-                await cur.execute("""
-                    CREATE TABLE IF NOT EXISTS level_rewards (
-                        guild_id BIGINT UNSIGNED NOT NULL,
-                        level INT UNSIGNED NOT NULL,
-                        role_id BIGINT UNSIGNED NOT NULL,
-                        PRIMARY KEY (guild_id, level)
-                    )
-                """)
+        try:
+            async with self.bot.db_pool.acquire() as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute("""
+                        CREATE TABLE IF NOT EXISTS levels (
+                            user_id BIGINT UNSIGNED NOT NULL,
+                            guild_id BIGINT UNSIGNED NOT NULL,
+                            xp BIGINT UNSIGNED NOT NULL DEFAULT 0,
+                            level INT UNSIGNED NOT NULL DEFAULT 1,
+                            PRIMARY KEY (user_id, guild_id)
+                        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+                    """)
+                    await cur.execute("""
+                        CREATE TABLE IF NOT EXISTS level_rewards (
+                            guild_id BIGINT UNSIGNED NOT NULL,
+                            level INT UNSIGNED NOT NULL,
+                            role_id BIGINT UNSIGNED NOT NULL,
+                            PRIMARY KEY (guild_id, level)
+                        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+                    """)
+        except Exception:
+            log.exception("Failed to create level tables")
 
     async def _get_progress(self, guild_id: int, user_id: int):
         async with self.bot.db_pool.acquire() as conn:
