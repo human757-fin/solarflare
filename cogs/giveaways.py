@@ -127,24 +127,42 @@ class Giveaways(commands.Cog):
         # Table creation must never prevent the cog from registering its commands.
         if self.bot.db_pool:
             try:
-                await self._ensure_tables()
+                await self._reconcile_tables()
                 await self._create_tables()
             except Exception:
                 log.exception("Failed to create giveaway tables")
 
-    async def _ensure_tables(self):
-        # Legacy: the first release created FK-constrained tables that some
-        # MySQL/MariaDB collations reject (errno 150). Drop them so the plain
-        # schema below can be created cleanly on the next boot.
+    async def _reconcile_tables(self):
+        # Earlier releases produced stale/malformed giveaway tables (FK constraint
+        # creation failures). Detect any giveaway table that lacks the expected
+        # columns or carries leftover foreign keys and rebuild all three cleanly.
+        gv = ("giveaways", "giveaway_entries", "giveaway_winners")
         async with self.bot.db_pool.acquire() as conn:
             async with conn.cursor() as cur:
                 await cur.execute(
-                    "SELECT COUNT(*) FROM information_schema.REFERENTIAL_CONSTRAINTS "
-                    "WHERE CONSTRAINT_SCHEMA = DATABASE() "
-                    "AND CONSTRAINT_NAME IN ('fk_giveaway_entries', 'fk_giveaway_winners')"
+                    "SELECT CONSTRAINT_NAME, TABLE_NAME FROM information_schema.REFERENTIAL_CONSTRAINTS "
+                    "WHERE CONSTRAINT_SCHEMA = DATABASE() AND TABLE_NAME IN ('giveaways','giveaway_entries','giveaway_winners')"
                 )
-                row = await cur.fetchone()
-                if row and row[0]:
+                stale_fks = await cur.fetchall()
+                await cur.execute(
+                    "SELECT TABLE_NAME FROM information_schema.TABLES "
+                    "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME IN ('giveaways','giveaway_entries','giveaway_winners')"
+                )
+                existing = {r[0] for r in await cur.fetchall()}
+                cols = set()
+                if "giveaways" in existing:
+                    await cur.execute(
+                        "SELECT COLUMN_NAME FROM information_schema.COLUMNS "
+                        "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'giveaways'"
+                    )
+                    cols = {r[0] for r in await cur.fetchall()}
+                missing_any = not all(t in existing for t in gv)
+                missing_id = "giveaways" in existing and "id" not in cols
+                if stale_fks or missing_any or missing_id:
+                    log.warning(
+                        "Rebuilding giveaway tables (stale_fks=%s, missing_any=%s, missing_id=%s, old_columns=%s)",
+                        bool(stale_fks), missing_any, missing_id, sorted(cols),
+                    )
                     await cur.execute("SET FOREIGN_KEY_CHECKS = 0")
                     await cur.execute("DROP TABLE IF EXISTS giveaway_winners")
                     await cur.execute("DROP TABLE IF EXISTS giveaway_entries")
