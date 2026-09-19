@@ -261,53 +261,6 @@ async def slash_reload(interaction: discord.Interaction, cog: str):
     except Exception as e:
         await interaction.response.send_message(f"Error: {e}", ephemeral=True)
 
-
-# ---------------------------------------------------------------------------
-# Health server
-# ---------------------------------------------------------------------------
-
-def run_health_server():
-    from http.server import BaseHTTPRequestHandler, HTTPServer
-
-    class HealthHandler(BaseHTTPRequestHandler):
-        def do_GET(self):
-            if self.path == "/health":
-                body = b'{"status":"ok"}'
-                self.send_response(200)
-            else:
-                body = b'{"status":"unknown"}'
-                self.send_response(404)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-
-        def do_POST(self):
-            if self.path == "/restart":
-                body = b'{"status":"restarting"}'
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
-                threading.Thread(target=os._exit, args=(0,), daemon=True).start()
-                return
-            self.send_response(404)
-            self.end_headers()
-
-        def log_message(self, *args):
-            pass
-
-    server = HTTPServer(("0.0.0.0", BOT_PORT), HealthHandler)
-    log.info("Health server listening on port %s", BOT_PORT)
-    server.serve_forever()
-
-
-import threading
-health_thread = threading.Thread(target=run_health_server, daemon=True)
-health_thread.start()
-
-
 # ---------------------------------------------------------------------------
 # Entry
 # ---------------------------------------------------------------------------
@@ -316,7 +269,6 @@ async def main():
     if not BOT_TOKEN:
         log.error("DISCORD_TOKEN environment variable is not set")
         return
-    await init_db()
     async with bot:
         await load_cogs()
         await bot.start(BOT_TOKEN)
