@@ -126,6 +126,42 @@ footer, thumbnail and image (banner). `{user.avatar}` is great for the image/thu
 
 Drop `.py` files into `./cogs/` — they auto-load on startup.
 
+### Levels (`cogs/levels.py`)
+
+Members earn XP per message (15–25 XP, 60s per-user cooldown per guild). Level
+progress is stored in MySQL (`levels`, `level_rewards`), so it survives restarts.
+
+| Command | Description |
+|---|---|
+| `/rank view [user]` | Show XP, level and progress toward the next level |
+| `/rank leaderboard` | Top 10 members by level |
+| `/level add <user> <amount>` | Grant XP (admin) |
+| `/level set <user> <level>` | Set a level (admin) |
+| `/level rewards <level> <role>` | Grant a role when that level is reached (admin) |
+| `/level clearrewards <level>` | Remove a level role reward (admin) |
+
+Level formula: XP needed for the next level = `5·level² + 50·level + 100`.
+
+### Giveaways (`cogs/giveaways.py`)
+
+Giveaways are fully stored in MySQL (`giveaways`, `giveaway_entries`,
+`giveaway_winners`). The **Enter** button is a persistent view re-registered at
+startup, so entries and winners survive restarts. Entries use a button, not reactions.
+
+| Command | Description |
+|---|---|
+| `/giveaway start <prize> [channel] [winners] [duration] [extra_role] [extra_entries]` | Start a giveaway |
+| `/giveaway end <message_id>` | End early and pick winners |
+| `/giveaway reroll <message_id>` | Pick new winners, excluding previous ones |
+| `/giveaway edit <message_id> [prize] [winners] [duration]` | Edit an active giveaway |
+| `/giveaway list` | List active giveaways |
+
+- `duration` supports compact forms: `45m`, `2h`, `1d`, `3h30m`
+- `extra_role` + `extra_entries`: a role gets bonus entries automatically when joining
+- Winner selection is **weighted** — a user with bonus entries has proportionally more chances
+- Rerolls never re-pick users who already won that giveaway
+- End times are checked every 15 seconds by a background loop
+
 ```bash
 # create example cog
 mkdir -p cogs
