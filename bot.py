@@ -1,5 +1,7 @@
 import os
 import json
+import math
+import secrets
 import asyncio
 import logging
 import platform
@@ -29,6 +31,11 @@ BOT_PORT = int(os.environ.get("BOT_PORT") or os.environ.get("HEALTH_PORT") or 20
 DEV_GUILD_ID = os.environ.get("DEV_GUILD_ID", "")
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "")
 GIT_ADDRESS = os.environ.get("GIT_ADDRESS", "")
+
+# Shared secret used to authorise restart requests to /restart. Falls back to the
+# web panel password so no extra egg variable is required.
+RESTART_TOKEN = os.environ.get("RESTART_TOKEN") or os.environ.get("WEBUI_PASSWORD") or ""
+RESTART_REQUIRE_TOKEN = os.environ.get("RESTART_REQUIRE_TOKEN", "1") == "1"
 
 
 def get_code_revision(base_dir: str = "") -> str:
@@ -185,6 +192,12 @@ def build_welcome_embed(raw_embed, member: discord.Member) -> discord.Embed | No
 async def on_ready():
     log.info("Logged in as %s (ID: %s)", bot.user, bot.user.id)
     log.info("Guilds: %s", len(bot.guilds))
+    if bot.owner_id is None:
+        try:
+            app_info = await bot.application_info()
+            bot.owner_id = app_info.owner.id
+        except Exception:
+            log.exception("Could not determine bot owner from application info")
     if not heartbeat_loop.is_running():
         heartbeat_loop.start()
     try:
@@ -349,9 +362,11 @@ def _health_payload() -> dict:
     except Exception:
         # bot.latency needs a live gateway connection (and is NaN until ready)
         latency_ms = None
+    if latency_ms is not None and math.isnan(latency_ms):
+        latency_ms = None
     return {
         "status": "ok",
-        "ready": bot.is_ready,
+        "ready": bot.is_ready(),
         "revision": CODE_REVISION,
         "port": BOT_PORT,
         "user": str(bot.user) if bot.user else None,
@@ -390,6 +405,13 @@ async def health_handler(request: web.Request) -> web.Response:
 
 
 async def restart_handler(request: web.Request) -> web.Response:
+    if RESTART_REQUIRE_TOKEN:
+        token = request.headers.get("X-Restart-Token", "")
+        if not RESTART_TOKEN or not secrets.compare_digest(token.encode(), RESTART_TOKEN.encode()):
+            return web.json_response(
+                {"status": "forbidden", "error": "invalid or missing restart token"},
+                status=403,
+            )
     log.warning("Restart requested via the health endpoint")
     # Letting the process exit is what makes Pterodactyl start it again.
     asyncio.get_running_loop().call_later(0.5, os._exit, 0)

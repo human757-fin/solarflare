@@ -53,6 +53,8 @@ All set in the Pterodactyl panel under **Startup → Variables**.
 | `BOT_PORT` | Health/restart port the bot listens on (falls back to `HEALTH_PORT`, default `2067`) |
 | `BOT_HEALTH_URL` | Optional exact health URL; when unset the panel probes `127.0.0.1` and `localhost` |
 | `BOT_RESTART_URL` | Restart endpoint used by the Dashboard button (default `http://127.0.0.1:$BOT_PORT/restart`) |
+| `RESTART_TOKEN` | Optional shared secret for `/restart`. Falls back to `WEBUI_PASSWORD` if unset |
+| `RESTART_REQUIRE_TOKEN` | Set `0` to allow unauthenticated restarts (default `1`) |
 | `GIT_ADDRESS` | Git repository URL (used by egg) |
 | `BRANCH` | Git branch to pull (default `main`) |
 

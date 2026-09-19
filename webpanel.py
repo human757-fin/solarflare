@@ -35,6 +35,7 @@ WEBUI_SECURE_COOKIE = os.environ.get("WEBUI_SECURE_COOKIE", "0") == "1"
 # Optional explicit override; when empty the panel probes common localhost URLs.
 BOT_HEALTH_URL = os.environ.get("BOT_HEALTH_URL", "")
 BOT_RESTART_URL = os.environ.get("BOT_RESTART_URL", f"http://127.0.0.1:{BOT_PORT}/restart")
+RESTART_TOKEN = os.environ.get("RESTART_TOKEN") or os.environ.get("WEBUI_PASSWORD") or ""
 
 DB_HOST = os.environ.get("DB_HOST", "127.0.0.1")
 DB_PORT = int(os.environ.get("DB_PORT", 3306))
@@ -810,6 +811,8 @@ def diagnostics():
         {env_row('BOT_PORT')}{env_row('HEALTH_PORT')}{env_row('BOT_HEALTH_URL')}{env_row('BOT_RESTART_URL')}
         {env_row('BOT_PY_FILE')}{env_row('WEB_PORT')}{env_row('DATABASE_ENGINE')}{env_row('DB_HOST')}
         {env_row('DB_PORT')}{env_row('DB_NAME')}{env_row('DB_USER')}{env_row('DB_SSL')}{env_row('LOG_LEVEL')}
+        {env_row('RESTART_REQUIRE_TOKEN')}
+        <tr><td><code>RESTART_TOKEN</code></td><td><code>{'set' if RESTART_TOKEN else 'not set'}</code></td></tr>
       </table>
       <p style="color:#72767d;margin-top:0.5rem">Secrets (tokens and passwords) are never shown here.</p>
     </div>
@@ -825,11 +828,20 @@ def diagnostics():
 @login_required
 def api_restart():
     try:
-        req = urllib.request.Request(BOT_RESTART_URL, method="POST")
+        req = urllib.request.Request(
+            BOT_RESTART_URL,
+            method="POST",
+            headers={"X-Restart-Token": RESTART_TOKEN},
+        )
         with urllib.request.urlopen(req, timeout=5):
             pass
         _health_cache.update(time=0.0, data=None, url=None, error=None)
         flash("Bot restart signal sent", "success")
+    except urllib.error.HTTPError as e:
+        if e.code == 403:
+            flash("Restart refused: the panel and bot do not share a restart token", "error")
+        else:
+            flash(f"Restart failed: HTTP {e.code}", "error")
     except Exception as e:
         flash(f"Restart failed: {e}", "error")
     return redirect(url_for("dashboard"))
