@@ -2,6 +2,8 @@ import os
 import json
 import asyncio
 import logging
+import platform
+import traceback
 import aiohttp
 import discord
 from aiohttp import web
@@ -340,13 +342,14 @@ async def slash_reload(interaction: discord.Interaction, cog: str):
 # Health server (polled by webpanel.py)
 # ---------------------------------------------------------------------------
 
-async def health_handler(request: web.Request) -> web.Response:
+def _health_payload() -> dict:
+    """Build the health payload; any exception here is reported, never a 500."""
     try:
         latency_ms = round(bot.latency * 1000)
     except Exception:
         # bot.latency needs a live gateway connection (and is NaN until ready)
         latency_ms = None
-    payload = {
+    return {
         "status": "ok",
         "ready": bot.is_ready,
         "revision": CODE_REVISION,
@@ -366,8 +369,24 @@ async def health_handler(request: web.Request) -> web.Response:
         "latency_ms": latency_ms,
         "uptime_seconds": int((datetime.utcnow() - bot.start_time).total_seconds()),
         "database": bot.db_pool is not None,
+        "python": platform.python_version(),
+        "discordpy": discord.__version__,
     }
-    return web.json_response(payload)
+
+
+async def health_handler(request: web.Request) -> web.Response:
+    # The panel displays the error, so always answer 200 - an HTTP 500 would
+    # hide the actual exception behind a generic aiohttp error page.
+    try:
+        return web.json_response(_health_payload())
+    except Exception as exc:
+        log.exception("Failed to build the health payload")
+        detail = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))[-1500:]
+        return web.json_response({
+            "status": "error",
+            "error": f"{type(exc).__name__}: {exc}",
+            "traceback": detail,
+        })
 
 
 async def restart_handler(request: web.Request) -> web.Response:

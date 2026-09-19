@@ -19,8 +19,8 @@ from flask import (
 
 from markupsafe import Markup, escape
 
-import aiomysql
-import asyncio
+import pymysql
+from pymysql.cursors import DictCursor
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("FLASK_SECRET", secrets.token_hex(32))
@@ -66,21 +66,27 @@ PANEL_REVISION = get_code_revision()
 
 
 def get_db():
-    loop = asyncio.new_event_loop()
-    kwargs = {}
+    """Synchronous MySQL connection for the panel.
+
+    PyMySQL (installed as aiomysql's own dependency) is used here because
+    driving an async MySQL client from Flask's synchronous request threads
+    with ``run_until_complete`` fails in production with
+    ``'_asyncio.Future' object has no attribute 'send'``.
+    """
+    kwargs = {"connect_timeout": 10, "charset": "utf8mb4"}
     if DB_SSL:
         kwargs["ssl"] = {"ca": None}
-    conn = loop.run_until_complete(
-        aiomysql.connect(
-            host=DB_HOST, port=DB_PORT, user=DB_USER,
-            password=DB_PASSWORD, db=DB_NAME, autocommit=True,
-            **kwargs,
-        )
+    return pymysql.connect(
+        host=DB_HOST, port=DB_PORT, user=DB_USER,
+        password=DB_PASSWORD, database=DB_NAME, autocommit=True,
+        cursorclass=DictCursor, **kwargs,
     )
-    return conn, loop
 
 
-_health_cache = {"time": 0.0, "data": None, "url": None, "error": None}
+_health_cache = {
+    "time": 0.0, "data": None, "url": None, "error": None,
+    "bot_error": None, "bot_traceback": None,
+}
 HEALTH_CACHE_SECONDS = 5
 # Failed probes are cached longer so an offline bot does not slow every page load.
 HEALTH_FAIL_CACHE_SECONDS = 15
@@ -88,7 +94,10 @@ HEALTH_FAIL_CACHE_SECONDS = 15
 
 def reset_health_cache():
     """Forget cached probe results so the next request re-checks immediately."""
-    _health_cache.update(time=0.0, data=None, url=None, error=None)
+    _health_cache.update(
+        time=0.0, data=None, url=None, error=None,
+        bot_error=None, bot_traceback=None,
+    )
 
 
 def health_candidates() -> list:
@@ -101,6 +110,15 @@ def health_candidates() -> list:
         if url not in candidates:
             candidates.append(url)
     return candidates
+
+
+def _parse_health_body(raw) -> dict | None:
+    """Parse a health endpoint body into a dict, or None when it is not JSON."""
+    try:
+        data = json.loads((raw or b"").decode("utf-8", "replace") or "{}")
+    except Exception:
+        return None
+    return data if isinstance(data, dict) else None
 
 
 def fetch_bot_health(timeout=2, force=False):
@@ -120,30 +138,54 @@ def fetch_bot_health(timeout=2, force=False):
         try:
             with urllib.request.urlopen(candidate, timeout=timeout) as resp:
                 if resp.status == 200:
-                    data = json.loads(resp.read().decode("utf-8") or "{}")
-                    working_url = candidate
-                    break
-                errors.append(f"{candidate} -> HTTP {resp.status}")
+                    data = _parse_health_body(resp.read())
+                    if data is not None:
+                        working_url = candidate
+                        break
+                    errors.append(f"{candidate} -> invalid JSON")
+                else:
+                    errors.append(f"{candidate} -> HTTP {resp.status}")
         except urllib.error.HTTPError as exc:
+            # An older bot build can answer HTTP 500; surface its body so the
+            # real error is visible instead of a bare status code.
+            body = _parse_health_body(exc.read() or b"")
+            if body and body.get("status") == "error":
+                data = body
+                working_url = candidate
+                break
             errors.append(f"{candidate} -> HTTP {exc.code}")
         except Exception as exc:
             errors.append(f"{candidate} -> {exc}")
 
+    bot_error = None
+    bot_traceback = None
+    if data:
+        if data.get("status") == "error":
+            bot_error = data.get("error") or "health endpoint reported an error"
+            bot_traceback = data.get("traceback")
+        elif data.get("error"):
+            bot_error = str(data["error"])
+
     error = None if data else "; ".join(errors)
     if error:
         log.warning("Bot health check failed: %s", error)
-    _health_cache.update(time=now, data=data, url=working_url, error=error)
+    _health_cache.update(
+        time=now, data=data, url=working_url, error=error,
+        bot_error=bot_error, bot_traceback=bot_traceback,
+    )
     return data
 
 
 def check_database():
     """Return (status, error) for the panel's own database connection."""
     try:
-        conn, loop = get_db()
-        cursor = loop.run_until_complete(conn.cursor())
-        loop.run_until_complete(cursor.execute("SELECT 1"))
-        conn.close()
-        loop.close()
+        conn = get_db()
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute("SELECT 1")
+                cursor.fetchone()
+        finally:
+            conn.close()
         return "connected", None
     except Exception as exc:
         return "unavailable", str(exc)
@@ -152,13 +194,14 @@ def check_database():
 def get_db_guild_count():
     """Guilds with stored settings, or None when the database is unreachable."""
     try:
-        conn, loop = get_db()
-        cursor = loop.run_until_complete(conn.cursor(aiomysql.DictCursor))
-        loop.run_until_complete(cursor.execute("SELECT COUNT(*) AS total FROM guild_settings"))
-        row = loop.run_until_complete(cursor.fetchone())
-        conn.close()
-        loop.close()
-        return int(row["total"]) if row else 0
+        conn = get_db()
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute("SELECT COUNT(*) AS total FROM guild_settings")
+                row = cursor.fetchone()
+            return int(row["total"]) if row else 0
+        finally:
+            conn.close()
     except Exception:
         return None
 
@@ -184,6 +227,13 @@ def get_bot_stats():
     """Bot status for the web panel, preferring the bot's own health endpoint."""
     health = fetch_bot_health()
     if health:
+        bot_error = None
+        bot_traceback = None
+        if health.get("status") == "error":
+            bot_error = health.get("error") or "health endpoint reported an error"
+            bot_traceback = health.get("traceback")
+        elif health.get("error"):
+            bot_error = str(health["error"])
         return {
             "status": "online",
             "guilds": int(health.get("guilds") or 0),
@@ -196,8 +246,12 @@ def get_bot_stats():
             "source": "bot",
             "revision": health.get("revision"),
             "bot_port": health.get("port"),
+            "python_version": health.get("python"),
+            "discordpy_version": health.get("discordpy"),
             "health_url": _health_cache.get("url"),
             "health_error": None,
+            "bot_error": bot_error,
+            "bot_traceback": bot_traceback,
         }
 
     db_guilds = get_db_guild_count()
@@ -213,8 +267,12 @@ def get_bot_stats():
         "source": "db",
         "revision": None,
         "bot_port": None,
+        "python_version": None,
+        "discordpy_version": None,
         "health_url": None,
         "health_error": _health_cache.get("error"),
+        "bot_error": None,
+        "bot_traceback": None,
     }
 
 
@@ -341,6 +399,11 @@ def status():
     guild_label = "Guilds" if stats["status"] == "online" else "Configured Guilds"
 
     if stats["status"] == "online":
+        bot_error_note = (
+            f'<p style="color:#faa61a">Bot error: <code>{escape(str(stats.get("bot_error")))}</code> - '
+            '<a href="/diagnostics?recheck=1">see Diagnostics for the traceback</a>.</p>'
+            if stats.get("bot_error") else ""
+        )
         health_details = f"""
       <p>Bot user: <code>{escape(stats['user'] or 'unknown')}</code></p>
       <p>Gateway: <code>{'ready' if stats['ready'] else 'connecting'}</code></p>
@@ -349,6 +412,7 @@ def status():
       <p>Database (bot): <code>{'connected' if stats['database'] else 'unavailable'}</code></p>
       <p>Bot revision: <code>{escape(str(stats['revision'] or 'not reported'))}</code></p>
       <p>Answered on: <code>{escape(str(stats['health_url'] or '-'))}</code></p>
+      {bot_error_note}
         """
     else:
         health_details = f"""
@@ -418,13 +482,14 @@ def dashboard():
     stats = get_bot_stats()
     settings_by_guild = {}
     try:
-        conn, loop = get_db()
-        cursor = loop.run_until_complete(conn.cursor(aiomysql.DictCursor))
-        loop.run_until_complete(cursor.execute("SELECT * FROM guild_settings ORDER BY guild_id"))
-        for row in loop.run_until_complete(cursor.fetchall()):
-            settings_by_guild[int(row["guild_id"])] = row
-        conn.close()
-        loop.close()
+        conn = get_db()
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute("SELECT * FROM guild_settings ORDER BY guild_id")
+                for row in cursor.fetchall():
+                    settings_by_guild[int(row["guild_id"])] = row
+        finally:
+            conn.close()
     except Exception as e:
         flash(f"DB error: {e}", "error")
 
@@ -483,14 +548,15 @@ def welcome_editor():
     settings = None
     if guild_id:
         try:
-            conn, loop = get_db()
-            cursor = loop.run_until_complete(conn.cursor(aiomysql.DictCursor))
-            loop.run_until_complete(
-                cursor.execute("SELECT * FROM guild_settings WHERE guild_id = %s", (int(guild_id),))
-            )
-            settings = loop.run_until_complete(cursor.fetchone())
-            conn.close()
-            loop.close()
+            conn = get_db()
+            try:
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        "SELECT * FROM guild_settings WHERE guild_id = %s", (int(guild_id),)
+                    )
+                    settings = cursor.fetchone()
+            finally:
+                conn.close()
         except Exception as e:
             flash(f"DB error: {e}", "error")
 
@@ -522,26 +588,27 @@ def welcome_editor():
                 embed_data["footer"] = {"text": embed_footer}
 
         try:
-            conn, loop = get_db()
-            cursor = loop.run_until_complete(conn.cursor())
-            loop.run_until_complete(cursor.execute(
-                """
-                INSERT INTO guild_settings (guild_id, welcome_channel_id, welcome_message, welcome_embed)
-                VALUES (%s, %s, %s, %s)
-                ON DUPLICATE KEY UPDATE
-                    welcome_channel_id = VALUES(welcome_channel_id),
-                    welcome_message = VALUES(welcome_message),
-                    welcome_embed = VALUES(welcome_embed)
-                """,
-                (
-                    int(guild_id),
-                    int(welcome_channel) if welcome_channel else None,
-                    welcome_message or None,
-                    json.dumps(embed_data) if embed_data else None,
-                ),
-            ))
-            conn.close()
-            loop.close()
+            conn = get_db()
+            try:
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        """
+                        INSERT INTO guild_settings (guild_id, welcome_channel_id, welcome_message, welcome_embed)
+                        VALUES (%s, %s, %s, %s)
+                        ON DUPLICATE KEY UPDATE
+                            welcome_channel_id = VALUES(welcome_channel_id),
+                            welcome_message = VALUES(welcome_message),
+                            welcome_embed = VALUES(welcome_embed)
+                        """,
+                        (
+                            int(guild_id),
+                            int(welcome_channel) if welcome_channel else None,
+                            welcome_message or None,
+                            json.dumps(embed_data) if embed_data else None,
+                        ),
+                    )
+            finally:
+                conn.close()
             flash("Welcome settings saved", "success")
         except Exception as e:
             flash(f"DB error: {e}", "error")
@@ -657,6 +724,32 @@ def diagnostics():
         "-" if not online
         else ("yes" if str(stats["bot_port"]) == str(BOT_PORT) else "NO - panel and bot disagree")
     )
+    bot_error = stats.get("bot_error")
+    bot_traceback = stats.get("bot_traceback")
+    bot_error_note = (
+        '<p style="color:#faa61a">The bot answered its health endpoint but reported an '
+        'internal error - see the Bot Error card below.</p>'
+        if bot_error else ""
+    )
+    bot_error_block = ""
+    if bot_error:
+        tb_html = (
+            '<pre style="background:#16161a;border:1px solid #ed4245;border-radius:6px;'
+            'padding:0.75rem;overflow-x:auto;white-space:pre-wrap;word-break:break-word">'
+            f'{escape(str(bot_traceback))}</pre>'
+            if bot_traceback else ""
+        )
+        bot_error_block = (
+            '<div class="card" style="border:1px solid #ed4245">'
+            '<h2 style="color:#ed4245">Bot Error</h2>'
+            '<p>The bot process is running and answered its health endpoint, but the endpoint '
+            'reported an internal error:</p>'
+            f'<p><code>{escape(str(bot_error))}</code></p>{tb_html}'
+            '<p style="color:#faa61a;margin-top:0.5rem">This error is why the panel cannot show '
+            'the bot&#39;s real status. If the bot revision below is older than the panel revision, '
+            'restart the server from Pterodactyl so it pulls the fixed code.</p>'
+            '</div>'
+        )
     restart_hint = (
         '<form method="post" action="/api/restart"><button class="btn btn-danger">Restart Bot</button></form>'
         if online else
@@ -672,9 +765,11 @@ def diagnostics():
       <p>Probed URLs: <code>{escape(', '.join(health_candidates()))}</code></p>
       <p>Answered on: <code>{escape(str(stats['health_url'] or '-'))}</code></p>
       <p>Last error: <code>{escape(str(stats['health_error'] or '-'))}</code></p>
+      {bot_error_note}
       <p><a href="/diagnostics?recheck=1">Recheck now</a></p>
       <div style="margin-top:0.5rem">{restart_hint}</div>
     </div>
+    {bot_error_block}
     <div class="card">
       <h2>Versions And Ports</h2>
       <table>
